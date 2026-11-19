@@ -22,14 +22,15 @@ GerritHub ── webhook ──▶ Worker ── repository_dispatch + ticket �
 - **A new patch set** runs when its uploader is in `TRUSTED`.
 - **Anyone else's patch set** runs when a trusted reviewer comments `recheck` on it. Untrusted code never reaches CI unless a maintainer asks for it.
 - **Other events, and projects missing from `PROJECTS`,** are acknowledged and ignored with a 200, so Gerrit doesn't retry them.
-- **If GitHub refuses the dispatch,** the Worker answers 502, so the webhooks plugin retries.
+- **Events it will act on** are answered 202 at once; confirming and dispatching happen afterwards, in the background. The webhooks plugin retries any delivery slower than its socket timeout, and every retry would dispatch another run, so the Worker never makes it wait.
+- **If Gerrit or GitHub fails,** the Worker retries twice itself, after 1 and 4 seconds, then gives up. A GitHub client error other than 429 isn't retried. The outcome of each event is in the Worker's logs (`npx wrangler tail`), and a maintainer can comment `recheck` to try again.
 
 **Events are confirmed with Gerrit.** The webhooks plugin can't sign its requests, so an event is only a hint. Before dispatching, the Worker fetches the change from Gerrit's REST API as the bot account, and checks the event against it:
 - **The patch set:** the revision, patch set number, ref and project must all match the event.
 - **For a new patch set:** Gerrit's record of the uploader must be trusted.
 - **For a recheck:** Gerrit must show a trusted reviewer's `recheck` on that patch set.
 
-Someone who learned the webhook URL could only make the Worker re-check real events; they couldn't get CI to run untrusted code, or the bot to vote on it. Events Gerrit doesn't confirm are ignored with a 200. If Gerrit can't be reached, the Worker answers 502, so the webhook is retried.
+Someone who learned the webhook URL could only make the Worker re-check real events; they couldn't get CI to run untrusted code, or the bot to vote on it. Events Gerrit doesn't confirm are dropped, and the Worker logs why.
 
 In the workflow, the job that runs the change's code gets no secrets and can't request an OIDC token. Only the `vote` job has `id-token: write`.
 

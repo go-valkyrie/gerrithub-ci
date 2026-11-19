@@ -17,7 +17,7 @@
 import { sameBytes, utf8 } from "./encoding";
 import { decide, type GerritEvent, type Policy, type Target } from "./gerrit";
 import { apiHeaders, installationToken } from "./github";
-import { confirmChange, fetchChange, type Confirmation } from "./verify";
+import { confirmChange, fetchChange } from "./verify";
 import { TokenError, verifyGithubToken, type GithubClaims } from "./oidc";
 import { openTicket, signTicket } from "./ticket";
 
@@ -54,9 +54,22 @@ export interface Deps {
   fetch: Fetch;
   /** Seconds since the epoch. */
   now: () => number;
+  /** Keeps the Worker alive for work that finishes after the response is sent. */
+  waitUntil: (work: Promise<unknown>) => void;
+  sleep: (ms: number) => Promise<void>;
+  /** Where background work reports what it did: the Worker's logs. */
+  log: (line: string) => void;
 }
 
-const defaultDeps: Deps = { fetch: (...args) => fetch(...args), now: () => Math.floor(Date.now() / 1000) };
+function depsFor(ctx: ExecutionContext): Deps {
+  return {
+    fetch: (...args) => fetch(...args),
+    now: () => Math.floor(Date.now() / 1000),
+    waitUntil: (work) => ctx.waitUntil(work),
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    log: (line) => console.log(line),
+  };
+}
 
 function text(body: string, status: number, headers: Record<string, string> = {}): Response {
   return new Response(body.endsWith("\n") ? body : `${body}\n`, { status, headers });
@@ -138,35 +151,63 @@ async function handleGerrit(request: Request, env: Env, deps: Deps): Promise<Res
     return text(`ignored: ${decision.reason}`, 200);
   }
 
-  // The event is only a hint: GerritHub can't sign it, so confirm it with Gerrit.
-  const gerrit = { url: gerritUrl(env), user: env.GERRIT_USER, password: env.GERRIT_HTTP_PASSWORD };
-  let confirmation: Confirmation;
-  try {
-    confirmation = confirmChange(await fetchChange(decision.target, gerrit, deps.fetch), decision.target, policy.trusted);
-  } catch (e) {
-    // 502, so the webhooks plugin retries once Gerrit answers.
-    return text(`could not confirm the event with Gerrit: ${(e as Error).message}`, 502);
-  }
-  if (!confirmation.confirmed) {
-    return text(`ignored: not confirmed by Gerrit: ${confirmation.reason}`, 200);
-  }
-  const target = { ...decision.target, uploader: confirmation.uploader };
+  // Answer at once and do the rest in the background. The webhooks plugin
+  // retries any delivery that takes longer than its socket timeout, and
+  // every retry would confirm and dispatch again.
+  deps.waitUntil(confirmAndDispatch(env, policy, decision.target, deps));
+  const { change, patchset, trigger } = decision.target;
+  return text(`accepted change ${change},${patchset} (${trigger}); confirming it with Gerrit`, 202);
+}
 
-  const repo = policy.projects[target.project];
-  let response: Response;
+/** A failure that retrying won't fix. */
+class Permanent extends Error {}
+
+/** Waits before each retry; one more attempt than delays. */
+const RETRY_DELAYS_MS = [1000, 4000];
+
+async function withRetries<T>(what: string, deps: Deps, attempt: () => Promise<T>): Promise<T> {
+  for (let i = 0; ; i++) {
+    try {
+      return await attempt();
+    } catch (e) {
+      if (e instanceof Permanent || i >= RETRY_DELAYS_MS.length) throw e;
+      deps.log(`${what} failed (${(e as Error).message}); retrying in ${RETRY_DELAYS_MS[i]} ms`);
+      await deps.sleep(RETRY_DELAYS_MS[i]);
+    }
+  }
+}
+
+/**
+ * Confirms the event with Gerrit and, if Gerrit agrees, dispatches the run.
+ * Runs after the webhook has been answered, so it reports to the logs.
+ */
+async function confirmAndDispatch(env: Env, policy: Policy, hint: Target, deps: Deps): Promise<void> {
+  const label = `change ${hint.change},${hint.patchset} (${hint.trigger})`;
   try {
-    response = await dispatch(env, repo, target, deps);
+    // The event is only a hint: GerritHub can't sign it, so confirm it with Gerrit.
+    const gerrit = { url: gerritUrl(env), user: env.GERRIT_USER, password: env.GERRIT_HTTP_PASSWORD };
+    const change = await withRetries("asking Gerrit", deps, () => fetchChange(hint, gerrit, deps.fetch));
+    const confirmation = confirmChange(change, hint, policy.trusted);
+    if (!confirmation.confirmed) {
+      deps.log(`ignored ${label}: not confirmed by Gerrit: ${confirmation.reason}`);
+      return;
+    }
+    const target = { ...hint, uploader: confirmation.uploader };
+    const repo = policy.projects[target.project];
+    await withRetries("dispatching to GitHub", deps, async () => {
+      const response = await dispatch(env, repo, target, deps);
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        const message = `GitHub returned ${response.status}: ${detail}`;
+        // A client error other than rate limiting won't go away on its own.
+        if (response.status >= 400 && response.status < 500 && response.status !== 429) throw new Permanent(message);
+        throw new Error(message);
+      }
+    });
+    deps.log(`dispatched ${repo} ${label}`);
   } catch (e) {
-    // 502, so the webhooks plugin retries once GitHub or the app is reachable.
-    return text(`could not authenticate to GitHub: ${(e as Error).message}`, 502);
+    deps.log(`failed ${label}: ${(e as Error).message}`);
   }
-  if (!response.ok) {
-    // 502, so the webhooks plugin retries.
-    const detail = await response.text().catch(() => "");
-    return text(`GitHub returned ${response.status}: ${detail}`, 502);
-  }
-  const { change, patchset, trigger } = target;
-  return text(`dispatched ${repo} change ${change},${patchset} (${trigger})`, 202);
 }
 
 // --- /vote --------------------------------------------------------------------
@@ -260,7 +301,7 @@ function secretMatches(given: string, secret: string): boolean {
   return secret.length > 0 && sameBytes(utf8.encode(given), utf8.encode(secret));
 }
 
-export async function handle(request: Request, env: Env, deps: Deps = defaultDeps): Promise<Response> {
+export async function handle(request: Request, env: Env, deps: Deps): Promise<Response> {
   const path = new URL(request.url).pathname;
   if (path === "/vote") return handleVote(request, env, deps);
   const gerrit = /^\/gerrit\/([^/]+)$/.exec(path);
@@ -271,7 +312,7 @@ export async function handle(request: Request, env: Env, deps: Deps = defaultDep
 }
 
 export default {
-  fetch(request: Request, env: Env): Promise<Response> {
-    return handle(request, env);
+  fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return handle(request, env, depsFor(ctx));
   },
 };
