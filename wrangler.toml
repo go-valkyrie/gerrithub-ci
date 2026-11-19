@@ -25,3 +25,7 @@ compatibility_date = "2026-11-01"
 #   BRANCH          main                                  (...and the branch it must run from)
 #
 # For local development, put them in .dev.vars (gitignored).
+
+# The Worker reports what it did with each webhook event in its logs; keep them.
+[observability]
+enabled = true
