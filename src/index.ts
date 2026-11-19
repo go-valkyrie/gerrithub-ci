@@ -14,6 +14,7 @@
 //   branch, checks the ticket, and votes Verified with its own Gerrit
 //   credentials.
 
+import { claimerFor, eventKey, type Claimer } from "./claims";
 import { sameBytes, utf8 } from "./encoding";
 import { decide, type GerritEvent, type Policy, type Target } from "./gerrit";
 import { apiHeaders, installationToken } from "./github";
@@ -21,7 +22,13 @@ import { confirmChange, fetchChange } from "./verify";
 import { TokenError, verifyGithubToken, type GithubClaims } from "./oidc";
 import { openTicket, signTicket } from "./ticket";
 
+export { EventClaim } from "./claims";
+
 export interface Env {
+  /** Durable Object namespace that de-duplicates deliveries; see src/claims.ts. */
+  EVENT_CLAIM: DurableObjectNamespace;
+  /** How long an event is remembered, in seconds; defaults to 600. */
+  DEDUPE_WINDOW_SECONDS?: string;
   /** Secret path segment GerritHub posts to. */
   WEBHOOK_SECRET: string;
   /** Key that signs tickets. */
@@ -59,10 +66,13 @@ export interface Deps {
   sleep: (ms: number) => Promise<void>;
   /** Where background work reports what it did: the Worker's logs. */
   log: (line: string) => void;
+  /** Claims an event key: true for the first delivery of an event, false for repeats. */
+  claim: Claimer;
 }
 
-function depsFor(ctx: ExecutionContext): Deps {
+function depsFor(ctx: ExecutionContext, env: Env): Deps {
   return {
+    claim: claimerFor(env.EVENT_CLAIM),
     fetch: (...args) => fetch(...args),
     now: () => Math.floor(Date.now() / 1000),
     waitUntil: (work) => ctx.waitUntil(work),
@@ -154,7 +164,7 @@ async function handleGerrit(request: Request, env: Env, deps: Deps): Promise<Res
   // Answer at once and do the rest in the background. The webhooks plugin
   // retries any delivery that takes longer than its socket timeout, and
   // every retry would confirm and dispatch again.
-  deps.waitUntil(confirmAndDispatch(env, policy, decision.target, deps));
+  deps.waitUntil(confirmAndDispatch(env, policy, event, decision.target, deps));
   const { change, patchset, trigger } = decision.target;
   return text(`accepted change ${change},${patchset} (${trigger}); confirming it with Gerrit`, 202);
 }
@@ -181,9 +191,24 @@ async function withRetries<T>(what: string, deps: Deps, attempt: () => Promise<T
  * Confirms the event with Gerrit and, if Gerrit agrees, dispatches the run.
  * Runs after the webhook has been answered, so it reports to the logs.
  */
-async function confirmAndDispatch(env: Env, policy: Policy, hint: Target, deps: Deps): Promise<void> {
+async function confirmAndDispatch(env: Env, policy: Policy, event: GerritEvent, hint: Target, deps: Deps): Promise<void> {
   const label = `change ${hint.change},${hint.patchset} (${hint.trigger})`;
   try {
+    // Every Gerrit node posts the event, so claim it before doing any work.
+    // This is after the cheap checks in decide(), so a forged event can at
+    // worst use up a key, and before the Gerrit call, so repeats cost nothing.
+    // If the claim itself fails, dispatch anyway: a duplicate run is better
+    // than none.
+    let first = true;
+    try {
+      first = await deps.claim(await eventKey(event, hint));
+    } catch (e) {
+      deps.log(`could not claim ${label} (${(e as Error).message}); dispatching anyway`);
+    }
+    if (!first) {
+      deps.log(`duplicate delivery of ${label}; ignored`);
+      return;
+    }
     // The event is only a hint: GerritHub can't sign it, so confirm it with Gerrit.
     const gerrit = { url: gerritUrl(env), user: env.GERRIT_USER, password: env.GERRIT_HTTP_PASSWORD };
     const change = await withRetries("asking Gerrit", deps, () => fetchChange(hint, gerrit, deps.fetch));
@@ -313,6 +338,6 @@ export async function handle(request: Request, env: Env, deps: Deps): Promise<Re
 
 export default {
   fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    return handle(request, env, depsFor(ctx));
+    return handle(request, env, depsFor(ctx, env));
   },
 };

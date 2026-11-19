@@ -1,5 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetTokenCache } from "../src/github";
+import { EventClaim } from "../src/claims";
 import { handle, type Env } from "../src/index";
 import { openTicket } from "../src/ticket";
 import { testKey } from "./keys";
@@ -10,6 +11,7 @@ beforeAll(async () => {
   env = {
     WEBHOOK_SECRET: "s3cret",
     TICKET_SECRET: "ticket-key",
+    EVENT_CLAIM: undefined as unknown as DurableObjectNamespace,
     GITHUB_APP_ID: "12345",
     GITHUB_APP_PRIVATE_KEY: (await testKey()).pkcs1Pem,
     GERRIT_USER: "ci-bot",
@@ -51,7 +53,7 @@ function gerritChange(uploader = "maintainer") {
     revisions: {
       "0123456789abcdef0123456789abcdef01234567": { _number: 1, ref: "refs/changes/07/7/1", uploader: { username: uploader } },
     },
-    messages: [],
+    messages: [{ _revision_number: 1, message: "Patch Set 1:\n\nrecheck", author: { username: "maintainer" } }],
   };
 }
 
@@ -75,7 +77,7 @@ function github(dispatchStatus = 204, uploader = "maintainer") {
 }
 
 /** Deps whose background work, sleeps and log lines the test can see. */
-function deps(fetchImpl: unknown) {
+function deps(fetchImpl: unknown, claim: (key: string) => Promise<boolean> = async () => true) {
   const pending: Promise<unknown>[] = [];
   const logs: string[] = [];
   const sleeps: number[] = [];
@@ -91,6 +93,7 @@ function deps(fetchImpl: unknown) {
     log: (line: string) => {
       logs.push(line);
     },
+    claim,
     logs,
     sleeps,
     /** Waits for the work done after the response. */
@@ -232,5 +235,153 @@ describe("/gerrit/<secret>", () => {
     await d.settled();
     expect(fetchImpl).toHaveBeenCalledTimes(3);
     expect(d.logs.at(-1)).toMatch(/^failed change 7,1 .*Gerrit returned 503/);
+  });
+});
+
+/** An in-memory stand-in for the Durable Object namespace: one claim per key. */
+function memoryClaimer() {
+  const seen = new Set<string>();
+  const keys: string[] = [];
+  const claim = async (key: string) => {
+    keys.push(key);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  };
+  return { claim, keys };
+}
+
+const recheck = (createdOn: number, text = "Patch Set 1:\n\nrecheck") => ({
+  type: "comment-added",
+  eventCreatedOn: createdOn,
+  author: { username: "maintainer" },
+  comment: text,
+  change: event.change,
+  patchSet: event.patchSet,
+});
+
+describe("de-duplication", () => {
+  it("dispatches once for five deliveries of one event", async () => {
+    const fetchImpl = github();
+    const { claim } = memoryClaimer();
+    const d = deps(fetchImpl, claim);
+    for (let i = 0; i < 5; i++) {
+      expect((await handle(post("/gerrit/s3cret", event), env, d)).status).toBe(202);
+    }
+    await d.settled();
+    expect(calls(fetchImpl, "/dispatches")).toBe(1);
+    expect(d.logs.filter((l) => l === "duplicate delivery of change 7,1 (patchset-created); ignored")).toHaveLength(4);
+  });
+
+  it("runs two different rechecks on the same patch set, but not repeats of one", async () => {
+    const fetchImpl = github();
+    const { claim } = memoryClaimer();
+    const d = deps(fetchImpl, claim);
+    for (const e of [recheck(1000), recheck(1000), recheck(1000), recheck(2000), recheck(2000)]) {
+      await handle(post("/gerrit/s3cret", e), env, d);
+    }
+    await d.settled();
+    expect(calls(fetchImpl, "/dispatches")).toBe(2);
+  });
+
+  it("keys differ by type, patch set and comment, and ignore the delivery order", async () => {
+    const { claim, keys } = memoryClaimer();
+    const d = deps(github(), claim);
+    const ps2 = { ...event.patchSet, number: 2, ref: "refs/changes/07/7/2" };
+    for (const e of [event, { ...event, patchSet: ps2 }, recheck(1000), recheck(1000, "recheck\n\nplease")]) {
+      await handle(post("/gerrit/s3cret", e), env, d);
+    }
+    await d.settled();
+    expect(new Set(keys).size).toBe(4);
+  });
+
+  it("claims after the cheap checks, so an ignored event claims nothing", async () => {
+    const claim = vi.fn(async () => true);
+    const d = deps(github(), claim);
+    await handle(post("/gerrit/s3cret", { ...event, type: "ref-updated" }), env, d);
+    await d.settled();
+    expect(claim).not.toHaveBeenCalled();
+  });
+
+  it("claims before asking Gerrit, so a duplicate makes no requests", async () => {
+    const fetchImpl = github();
+    const d = deps(fetchImpl, async () => false);
+    await handle(post("/gerrit/s3cret", event), env, d);
+    await d.settled();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("dispatches anyway, and logs it, when the claim fails", async () => {
+    const fetchImpl = github();
+    const d = deps(fetchImpl, async () => {
+      throw new Error("Durable Object unavailable");
+    });
+    await handle(post("/gerrit/s3cret", event), env, d);
+    await d.settled();
+    expect(calls(fetchImpl, "/dispatches")).toBe(1);
+    expect(d.logs[0]).toBe("could not claim change 7,1 (patchset-created) (Durable Object unavailable); dispatching anyway");
+    expect(d.logs.at(-1)).toMatch(/^dispatched /);
+  });
+});
+
+describe("EventClaim", () => {
+  function fakeState() {
+    const data = new Map<string, unknown>();
+    let alarm: number | undefined;
+    return {
+      data,
+      alarmAt: () => alarm,
+      storage: {
+        get: async (k: string) => data.get(k),
+        put: async (k: string, v: unknown) => void data.set(k, v),
+        setAlarm: async (t: number) => void (alarm = t),
+        deleteAll: async () => {
+          data.clear();
+          alarm = undefined;
+        },
+      },
+    };
+  }
+
+  it("grants the first claim and refuses the rest", async () => {
+    const claim = new EventClaim(fakeState(), {}, () => 0);
+    expect(await claim.claim()).toBe(true);
+    expect(await claim.claim()).toBe(false);
+    expect(await claim.claim()).toBe(false);
+  });
+
+  it("serves claims over fetch", async () => {
+    const claim = new EventClaim(fakeState(), {}, () => 0);
+    expect(await (await claim.fetch(new Request("https://x/"))).json()).toEqual({ claimed: true });
+    expect(await (await claim.fetch(new Request("https://x/"))).json()).toEqual({ claimed: false });
+  });
+
+  it("sets an alarm ten minutes out, once, when first claimed", async () => {
+    const state = fakeState();
+    let now = 5_000;
+    const claim = new EventClaim(state, {}, () => now);
+    await claim.claim();
+    expect(state.alarmAt()).toBe(5_000 + 600_000);
+    now = 9_000;
+    await claim.claim();
+    expect(state.alarmAt()).toBe(5_000 + 600_000);
+  });
+
+  it("honours DEDUPE_WINDOW_SECONDS, and ignores a bad value", async () => {
+    const a = fakeState();
+    await new EventClaim(a, { DEDUPE_WINDOW_SECONDS: "30" }, () => 0).claim();
+    expect(a.alarmAt()).toBe(30_000);
+    const b = fakeState();
+    await new EventClaim(b, { DEDUPE_WINDOW_SECONDS: "soon" }, () => 0).claim();
+    expect(b.alarmAt()).toBe(600_000);
+  });
+
+  it("deletes everything when the alarm fires, and a later claim starts fresh", async () => {
+    const state = fakeState();
+    const claim = new EventClaim(state, {}, () => 0);
+    await claim.claim();
+    await claim.alarm();
+    expect(state.data.size).toBe(0);
+    expect(await claim.claim()).toBe(true);
   });
 });
