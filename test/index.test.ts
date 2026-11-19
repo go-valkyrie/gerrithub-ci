@@ -74,8 +74,32 @@ function github(dispatchStatus = 204, uploader = "maintainer") {
   });
 }
 
+/** Deps whose background work, sleeps and log lines the test can see. */
 function deps(fetchImpl: unknown) {
-  return { fetch: fetchImpl as typeof fetch, now: () => NOW };
+  const pending: Promise<unknown>[] = [];
+  const logs: string[] = [];
+  const sleeps: number[] = [];
+  return {
+    fetch: fetchImpl as typeof fetch,
+    now: () => NOW,
+    waitUntil: (work: Promise<unknown>) => {
+      pending.push(work);
+    },
+    sleep: async (ms: number) => {
+      sleeps.push(ms);
+    },
+    log: (line: string) => {
+      logs.push(line);
+    },
+    logs,
+    sleeps,
+    /** Waits for the work done after the response. */
+    settled: () => Promise.all(pending),
+  };
+}
+
+function calls(fetchImpl: { mock: { calls: unknown[][] } }, suffix: string) {
+  return fetchImpl.mock.calls.filter(([u]) => String(u).endsWith(suffix)).length;
 }
 
 function dispatchCall(fetchImpl: ReturnType<typeof github>) {
@@ -85,8 +109,12 @@ function dispatchCall(fetchImpl: ReturnType<typeof github>) {
 describe("/gerrit/<secret>", () => {
   it("dispatches a run to GitHub as the app, with a signed ticket", async () => {
     const fetchImpl = github();
-    const res = await handle(post("/gerrit/s3cret", event), env, deps(fetchImpl));
+    const d = deps(fetchImpl);
+    const res = await handle(post("/gerrit/s3cret", event), env, d);
     expect(res.status).toBe(202);
+    expect(await res.text()).toMatch(/^accepted change 7,1/);
+    await d.settled();
+    expect(d.logs).toEqual(["dispatched go-valkyrie/vali-scheme change 7,1 (patchset-created)"]);
     const call = dispatchCall(fetchImpl);
     expect(call).toBeDefined();
     const [url, init] = call!;
@@ -137,42 +165,72 @@ describe("/gerrit/<secret>", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it("returns 502 when GitHub refuses the dispatch, so Gerrit retries", async () => {
-    const res = await handle(post("/gerrit/s3cret", event), env, deps(github(401)));
-    expect(res.status).toBe(502);
+  it("answers at once, before Gerrit or GitHub reply, so the webhook isn't retried", async () => {
+    const fetchImpl = vi.fn(() => new Promise<Response>(() => {}));
+    const d = deps(fetchImpl);
+    const res = await handle(post("/gerrit/s3cret", event), env, d);
+    expect(res.status).toBe(202);
   });
 
-  it("returns 502 when the app can't get a token", async () => {
+  it("retries GitHub server errors, then gives up and logs it", async () => {
+    const fetchImpl = github(502);
+    const d = deps(fetchImpl);
+    await handle(post("/gerrit/s3cret", event), env, d);
+    await d.settled();
+    expect(calls(fetchImpl, "/dispatches")).toBe(3);
+    expect(d.sleeps).toEqual([1000, 4000]);
+    expect(d.logs.at(-1)).toMatch(/^failed change 7,1 \(patchset-created\): GitHub returned 502/);
+  });
+
+  it("doesn't retry a GitHub client error", async () => {
+    const fetchImpl = github(401);
+    const d = deps(fetchImpl);
+    await handle(post("/gerrit/s3cret", event), env, d);
+    await d.settled();
+    expect(calls(fetchImpl, "/dispatches")).toBe(1);
+    expect(d.sleeps).toEqual([]);
+    expect(d.logs).toEqual([expect.stringMatching(/^failed change 7,1 .*GitHub returned 401/)]);
+  });
+
+  it("logs when the app can't get a token, after retrying", async () => {
     const gerritOnly = github();
     const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) =>
       String(url).startsWith("https://review.gerrithub.io/") ? gerritOnly(url, init) : new Response("Not Found", { status: 404 }),
     );
-    const res = await handle(post("/gerrit/s3cret", event), env, deps(fetchImpl));
-    expect(res.status).toBe(502);
-    expect(await res.text()).toMatch(/could not authenticate to GitHub/);
+    const d = deps(fetchImpl);
+    await handle(post("/gerrit/s3cret", event), env, d);
+    await d.settled();
+    expect(calls(fetchImpl, "/installation")).toBe(3);
+    expect(d.logs.at(-1)).toMatch(/^failed change 7,1 .*installation on go-valkyrie\/vali-scheme returned 404/);
   });
 
   it("ignores a forged event that claims a trusted uploader Gerrit doesn't confirm", async () => {
     const fetchImpl = github(204, "outsider");
-    const res = await handle(post("/gerrit/s3cret", event), env, deps(fetchImpl));
-    expect(res.status).toBe(200);
-    expect(await res.text()).toMatch(/not confirmed by Gerrit: .*uploaded by outsider/);
+    const d = deps(fetchImpl);
+    const res = await handle(post("/gerrit/s3cret", event), env, d);
+    expect(res.status).toBe(202);
+    await d.settled();
+    expect(d.logs).toEqual([expect.stringMatching(/^ignored change 7,1 .*not confirmed by Gerrit: .*uploaded by outsider/)]);
     expect(dispatchCall(fetchImpl)).toBeUndefined();
   });
 
   it("asks Gerrit as the bot account before dispatching", async () => {
     const fetchImpl = github();
-    await handle(post("/gerrit/s3cret", event), env, deps(fetchImpl));
+    const d = deps(fetchImpl);
+    await handle(post("/gerrit/s3cret", event), env, d);
+    await d.settled();
     const gerritCall = fetchImpl.mock.calls.find(([u]) => String(u).startsWith("https://review.gerrithub.io/"));
     expect(gerritCall).toBeDefined();
     const init = gerritCall![1] as RequestInit;
     expect((init.headers as Record<string, string>).Authorization).toBe(`Basic ${btoa("ci-bot:gerrit-pass")}`);
   });
 
-  it("returns 502 when Gerrit can't be asked, so the webhook is retried", async () => {
+  it("retries Gerrit, and dispatches nothing if it never answers", async () => {
     const fetchImpl = vi.fn(async () => new Response("unavailable", { status: 503 }));
-    const res = await handle(post("/gerrit/s3cret", event), env, deps(fetchImpl));
-    expect(res.status).toBe(502);
-    expect(await res.text()).toMatch(/could not confirm the event with Gerrit/);
+    const d = deps(fetchImpl);
+    await handle(post("/gerrit/s3cret", event), env, d);
+    await d.settled();
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(d.logs.at(-1)).toMatch(/^failed change 7,1 .*Gerrit returned 503/);
   });
 });
