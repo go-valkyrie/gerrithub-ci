@@ -2,24 +2,26 @@ name = "gerrithub-ci"
 main = "src/index.ts"
 compatibility_date = "2026-11-01"
 
-[vars]
-# Gerrit project name -> GitHub "owner/repo" to send repository_dispatch to.
-PROJECTS = '{"go-valkyrie/vali-scheme": "go-valkyrie/vali-scheme"}'
-# Gerrit usernames or emails whose patch sets run CI without a "recheck".
-TRUSTED = '[]'
-# The GitHub App that sends repository_dispatch (Settings > Developer settings > GitHub Apps).
-GITHUB_APP_ID = ""
-# Optional, with their defaults:
-# GERRIT_URL = "https://review.gerrithub.io"
-# EVENT_TYPE = "gerrit-verify"
-# OIDC_AUDIENCE = "gerrithub-ci"
-# WORKFLOW = ".github/workflows/gerrit-verify.yml"   # the only workflow allowed to vote
-# BRANCH = "main"                                    # ...and the branch it must run from
-
-# Secrets, set with `npx wrangler secret put NAME`:
-#   WEBHOOK_SECRET        the path segment GerritHub posts to (/gerrit/<secret>)
-#   TICKET_SECRET         signs the ticket each dispatch carries and each vote returns
-#   GITHUB_APP_PRIVATE_KEY  the app's private key, the .pem GitHub gives you
+# Nothing about a particular deployment lives here, so anyone can deploy this
+# repository as it is. Set these with `npx wrangler secret put NAME`:
+#
+#   GITHUB_APP_ID           the GitHub App that sends the dispatches
+#   GITHUB_APP_PRIVATE_KEY  its private key, the .pem GitHub gives you
 #                           (`npx wrangler secret put GITHUB_APP_PRIVATE_KEY < app.pem`)
-#   GERRIT_USER           the GerritHub bot account that votes Verified
-#   GERRIT_HTTP_PASSWORD  its HTTP password
+#   PROJECTS                JSON: Gerrit project name -> GitHub "owner/repo", e.g.
+#                           {"go-valkyrie/vali-scheme": "go-valkyrie/vali-scheme"}
+#   TRUSTED                 JSON: Gerrit usernames or emails whose patch sets run CI
+#                           without a "recheck", e.g. ["alice", "bob@example.com"]
+#   WEBHOOK_SECRET          the path segment GerritHub posts to (/gerrit/<secret>)
+#   TICKET_SECRET           signs the ticket each dispatch carries and each vote returns
+#   GERRIT_USER             the GerritHub bot account that votes Verified
+#   GERRIT_HTTP_PASSWORD    its HTTP password
+#
+# Optional, with their defaults; set the same way to change them:
+#   GERRIT_URL      https://review.gerrithub.io
+#   EVENT_TYPE      gerrit-verify
+#   OIDC_AUDIENCE   gerrithub-ci
+#   WORKFLOW        .github/workflows/gerrit-verify.yml   (the only workflow allowed to vote)
+#   BRANCH          main                                  (...and the branch it must run from)
+#
+# For local development, put them in .dev.vars (gitignored).

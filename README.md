@@ -36,18 +36,23 @@ In the workflow, the job that runs the change's code gets no secrets and can't r
 
    For each dispatch, the Worker signs an app JWT and exchanges it for an installation token limited to that one repository and Contents: write. It caches the token until shortly before it expires. No personal token is involved.
 
-2. **Deploy the Worker.** Edit `PROJECTS`, `TRUSTED` and `GITHUB_APP_ID` in `wrangler.toml` first.
+2. **Deploy the Worker.** Every setting is a Worker secret, so this repository holds nothing about your deployment and anyone can deploy it as it is. `wrangler.toml` lists them all, with the optional ones and their defaults.
 
    ```sh
    mise install          # Node, from mise.toml
    npm ci
+   npx wrangler deploy   # the first deploy creates the Worker; it ignores every event until configured
+   npx wrangler secret put GITHUB_APP_ID         # the App ID from step 1
+   npx wrangler secret put GITHUB_APP_PRIVATE_KEY < app.pem   # the key from step 1
+   npx wrangler secret put PROJECTS              # e.g. {"go-valkyrie/vali-scheme": "go-valkyrie/vali-scheme"}
+   npx wrangler secret put TRUSTED               # e.g. ["your-gerrit-username"]
    npx wrangler secret put WEBHOOK_SECRET        # a long random string
    npx wrangler secret put TICKET_SECRET         # another long random string
-   npx wrangler secret put GITHUB_APP_PRIVATE_KEY < app.pem   # the key from step 1
    npx wrangler secret put GERRIT_USER           # the GerritHub bot account
    npx wrangler secret put GERRIT_HTTP_PASSWORD  # its HTTP password
-   npx wrangler deploy
    ```
+
+   Secrets take effect without redeploying, and later deploys keep them.
 
 3. **Point GerritHub at it.** As project owner, add `webhooks.config` to the project's `refs/meta/config`:
 
@@ -70,7 +75,7 @@ In the workflow, the job that runs the change's code gets no secrets and can't r
 
 5. **Add the workflow.** Copy `templates/gerrit-verify.yml` to `.github/workflows/` on the mirror's default branch, and replace its `Check` step with the repository's checks. Set the repository variable `GERRITHUB_CI_URL` to the Worker's URL. It's a variable, not a secret.
 
-   The Worker accepts votes only from that workflow file on that branch. To change either, set `WORKFLOW` or `BRANCH` in `wrangler.toml`.
+   The Worker accepts votes only from that workflow file on that branch. To change either, set the `WORKFLOW` or `BRANCH` secret.
 
 ## Develop
 
