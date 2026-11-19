@@ -23,9 +23,21 @@ compatibility_date = "2026-11-01"
 #   OIDC_AUDIENCE   gerrithub-ci
 #   WORKFLOW        .github/workflows/gerrit-verify.yml   (the only workflow allowed to vote)
 #   BRANCH          main                                  (...and the branch it must run from)
+#   DEDUPE_WINDOW_SECONDS  600   (how long an event is remembered, so repeat deliveries are dropped)
 #
 # For local development, put them in .dev.vars (gitignored).
 
 # The Worker reports what it did with each webhook event in its logs; keep them.
 [observability]
 enabled = true
+
+# De-duplicates the several deliveries of each event (see src/claims.ts). One
+# Durable Object per event, deleted after the window; SQLite-backed, so it
+# works on the Workers Free plan.
+[[durable_objects.bindings]]
+name = "EVENT_CLAIM"
+class_name = "EventClaim"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["EventClaim"]

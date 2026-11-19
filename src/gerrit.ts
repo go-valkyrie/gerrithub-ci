@@ -31,6 +31,8 @@ export interface GerritEvent {
   uploader?: Account;
   author?: Account;
   comment?: string;
+  /** When Gerrit created the event, in seconds since the epoch. */
+  eventCreatedOn?: number;
 }
 
 /** What a CI run needs to know about the patch set it verifies. */
