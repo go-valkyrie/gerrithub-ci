@@ -28,20 +28,28 @@ In the workflow, the job that runs the change's code gets no secrets and can't r
 
 ## Set up
 
-1. **Deploy the Worker.** Edit `PROJECTS` and `TRUSTED` in `wrangler.toml` first.
+1. **Create a GitHub App** to send the dispatches, under Settings → Developer settings → GitHub Apps.
+   - **Permissions:** Repository → Contents: **Read and write**, which `repository_dispatch` needs. Metadata: read is added automatically. Nothing else.
+   - **Webhook:** turn it off.
+   - **Installation:** only on the mirror repository.
+   - **Settings to copy:** note the App ID for `GITHUB_APP_ID`, and generate a private key. GitHub's `.pem` (PKCS#1) works as-is.
+
+   For each dispatch, the Worker signs an app JWT and exchanges it for an installation token limited to that one repository and Contents: write. It caches the token until shortly before it expires. No personal token is involved.
+
+2. **Deploy the Worker.** Edit `PROJECTS`, `TRUSTED` and `GITHUB_APP_ID` in `wrangler.toml` first.
 
    ```sh
    mise install          # Node, from mise.toml
    npm ci
    npx wrangler secret put WEBHOOK_SECRET        # a long random string
    npx wrangler secret put TICKET_SECRET         # another long random string
-   npx wrangler secret put GITHUB_TOKEN          # fine-grained token: Contents read and write on the mirror
+   npx wrangler secret put GITHUB_APP_PRIVATE_KEY < app.pem   # the key from step 1
    npx wrangler secret put GERRIT_USER           # the GerritHub bot account
    npx wrangler secret put GERRIT_HTTP_PASSWORD  # its HTTP password
    npx wrangler deploy
    ```
 
-2. **Point GerritHub at it.** As project owner, add `webhooks.config` to the project's `refs/meta/config`:
+3. **Point GerritHub at it.** As project owner, add `webhooks.config` to the project's `refs/meta/config`:
 
    ```ini
    [remote "gerrithub-ci"]
@@ -58,9 +66,9 @@ In the workflow, the job that runs the change's code gets no secrets and can't r
 
    The plugin can't send an auth header, so the secret is part of the URL. Treat the URL as a secret.
 
-3. **Add a `Verified` label** to the project's `project.config` on `refs/meta/config`, if it doesn't have one. Grant the bot account permission to vote it.
+4. **Add a `Verified` label** to the project's `project.config` on `refs/meta/config`, if it doesn't have one. Grant the bot account permission to vote it.
 
-4. **Add the workflow.** Copy `templates/gerrit-verify.yml` to `.github/workflows/` on the mirror's default branch, and replace its `Check` step with the repository's checks. Set the repository variable `GERRITHUB_CI_URL` to the Worker's URL. It's a variable, not a secret.
+5. **Add the workflow.** Copy `templates/gerrit-verify.yml` to `.github/workflows/` on the mirror's default branch, and replace its `Check` step with the repository's checks. Set the repository variable `GERRITHUB_CI_URL` to the Worker's URL. It's a variable, not a secret.
 
    The Worker accepts votes only from that workflow file on that branch. To change either, set `WORKFLOW` or `BRANCH` in `wrangler.toml`.
 
