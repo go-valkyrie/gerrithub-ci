@@ -17,6 +17,7 @@
 import { sameBytes, utf8 } from "./encoding";
 import { decide, type GerritEvent, type Policy, type Target } from "./gerrit";
 import { apiHeaders, installationToken } from "./github";
+import { confirmChange, fetchChange, type Confirmation } from "./verify";
 import { TokenError, verifyGithubToken, type GithubClaims } from "./oidc";
 import { openTicket, signTicket } from "./ticket";
 
@@ -137,10 +138,24 @@ async function handleGerrit(request: Request, env: Env, deps: Deps): Promise<Res
     return text(`ignored: ${decision.reason}`, 200);
   }
 
-  const repo = policy.projects[decision.target.project];
+  // The event is only a hint: GerritHub can't sign it, so confirm it with Gerrit.
+  const gerrit = { url: gerritUrl(env), user: env.GERRIT_USER, password: env.GERRIT_HTTP_PASSWORD };
+  let confirmation: Confirmation;
+  try {
+    confirmation = confirmChange(await fetchChange(decision.target, gerrit, deps.fetch), decision.target, policy.trusted);
+  } catch (e) {
+    // 502, so the webhooks plugin retries once Gerrit answers.
+    return text(`could not confirm the event with Gerrit: ${(e as Error).message}`, 502);
+  }
+  if (!confirmation.confirmed) {
+    return text(`ignored: not confirmed by Gerrit: ${confirmation.reason}`, 200);
+  }
+  const target = { ...decision.target, uploader: confirmation.uploader };
+
+  const repo = policy.projects[target.project];
   let response: Response;
   try {
-    response = await dispatch(env, repo, decision.target, deps);
+    response = await dispatch(env, repo, target, deps);
   } catch (e) {
     // 502, so the webhooks plugin retries once GitHub or the app is reachable.
     return text(`could not authenticate to GitHub: ${(e as Error).message}`, 502);
@@ -150,7 +165,7 @@ async function handleGerrit(request: Request, env: Env, deps: Deps): Promise<Res
     const detail = await response.text().catch(() => "");
     return text(`GitHub returned ${response.status}: ${detail}`, 502);
   }
-  const { change, patchset, trigger } = decision.target;
+  const { change, patchset, trigger } = target;
   return text(`dispatched ${repo} change ${change},${patchset} (${trigger})`, 202);
 }
 

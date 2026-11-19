@@ -42,10 +42,29 @@ function post(path: string, body: unknown): Request {
   });
 }
 
-/** GitHub's API as the app sees it; `dispatchStatus` is what the dispatch returns. */
-function github(dispatchStatus = 204) {
+/** Change 7 as Gerrit reports it: patch set 1 uploaded by `uploader`. */
+function gerritChange(uploader = "maintainer") {
+  return {
+    project: "go-valkyrie/vali-scheme",
+    branch: "main",
+    _number: 7,
+    revisions: {
+      "0123456789abcdef0123456789abcdef01234567": { _number: 1, ref: "refs/changes/07/7/1", uploader: { username: uploader } },
+    },
+    messages: [],
+  };
+}
+
+/**
+ * GitHub's API as the app sees it, and Gerrit's for change 7; `dispatchStatus`
+ * is what the dispatch returns.
+ */
+function github(dispatchStatus = 204, uploader = "maintainer") {
   return vi.fn(async (url: string | URL | Request, _init?: RequestInit) => {
     const u = String(url);
+    if (u.startsWith("https://review.gerrithub.io/a/changes/go-valkyrie%2Fvali-scheme~7?")) {
+      return new Response(`)]}'\n${JSON.stringify(gerritChange(uploader))}`);
+    }
     if (u.endsWith("/installation")) return Response.json({ id: 99 });
     if (u.endsWith("/app/installations/99/access_tokens")) {
       return Response.json({ token: "ghs_installation", expires_at: new Date((NOW + 3600) * 1000).toISOString() }, { status: 201 });
@@ -124,9 +143,36 @@ describe("/gerrit/<secret>", () => {
   });
 
   it("returns 502 when the app can't get a token", async () => {
-    const fetchImpl = vi.fn(async () => new Response("Not Found", { status: 404 }));
+    const gerritOnly = github();
+    const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) =>
+      String(url).startsWith("https://review.gerrithub.io/") ? gerritOnly(url, init) : new Response("Not Found", { status: 404 }),
+    );
     const res = await handle(post("/gerrit/s3cret", event), env, deps(fetchImpl));
     expect(res.status).toBe(502);
     expect(await res.text()).toMatch(/could not authenticate to GitHub/);
+  });
+
+  it("ignores a forged event that claims a trusted uploader Gerrit doesn't confirm", async () => {
+    const fetchImpl = github(204, "outsider");
+    const res = await handle(post("/gerrit/s3cret", event), env, deps(fetchImpl));
+    expect(res.status).toBe(200);
+    expect(await res.text()).toMatch(/not confirmed by Gerrit: .*uploaded by outsider/);
+    expect(dispatchCall(fetchImpl)).toBeUndefined();
+  });
+
+  it("asks Gerrit as the bot account before dispatching", async () => {
+    const fetchImpl = github();
+    await handle(post("/gerrit/s3cret", event), env, deps(fetchImpl));
+    const gerritCall = fetchImpl.mock.calls.find(([u]) => String(u).startsWith("https://review.gerrithub.io/"));
+    expect(gerritCall).toBeDefined();
+    const init = gerritCall![1] as RequestInit;
+    expect((init.headers as Record<string, string>).Authorization).toBe(`Basic ${btoa("ci-bot:gerrit-pass")}`);
+  });
+
+  it("returns 502 when Gerrit can't be asked, so the webhook is retried", async () => {
+    const fetchImpl = vi.fn(async () => new Response("unavailable", { status: 503 }));
+    const res = await handle(post("/gerrit/s3cret", event), env, deps(fetchImpl));
+    expect(res.status).toBe(502);
+    expect(await res.text()).toMatch(/could not confirm the event with Gerrit/);
   });
 });
