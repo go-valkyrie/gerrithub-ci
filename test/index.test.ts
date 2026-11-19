@@ -1,16 +1,25 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { resetTokenCache } from "../src/github";
 import { handle, type Env } from "../src/index";
 import { openTicket } from "../src/ticket";
+import { testKey } from "./keys";
 
-export const env: Env = {
-  WEBHOOK_SECRET: "s3cret",
-  TICKET_SECRET: "ticket-key",
-  GITHUB_TOKEN: "ghp_test",
-  GERRIT_USER: "ci-bot",
-  GERRIT_HTTP_PASSWORD: "gerrit-pass",
-  PROJECTS: JSON.stringify({ "go-valkyrie/vali-scheme": "go-valkyrie/vali-scheme" }),
-  TRUSTED: JSON.stringify(["maintainer"]),
-};
+let env: Env;
+
+beforeAll(async () => {
+  env = {
+    WEBHOOK_SECRET: "s3cret",
+    TICKET_SECRET: "ticket-key",
+    GITHUB_APP_ID: "12345",
+    GITHUB_APP_PRIVATE_KEY: (await testKey()).pkcs1Pem,
+    GERRIT_USER: "ci-bot",
+    GERRIT_HTTP_PASSWORD: "gerrit-pass",
+    PROJECTS: JSON.stringify({ "go-valkyrie/vali-scheme": "go-valkyrie/vali-scheme" }),
+    TRUSTED: JSON.stringify(["maintainer"]),
+  };
+});
+
+beforeEach(() => resetTokenCache());
 
 const NOW = 1_800_000_000;
 
@@ -33,19 +42,37 @@ function post(path: string, body: unknown): Request {
   });
 }
 
+/** GitHub's API as the app sees it; `dispatchStatus` is what the dispatch returns. */
+function github(dispatchStatus = 204) {
+  return vi.fn(async (url: string | URL | Request, _init?: RequestInit) => {
+    const u = String(url);
+    if (u.endsWith("/installation")) return Response.json({ id: 99 });
+    if (u.endsWith("/app/installations/99/access_tokens")) {
+      return Response.json({ token: "ghs_installation", expires_at: new Date((NOW + 3600) * 1000).toISOString() }, { status: 201 });
+    }
+    if (u.endsWith("/dispatches")) return new Response(dispatchStatus === 204 ? null : "Bad credentials", { status: dispatchStatus });
+    return new Response("unexpected", { status: 500 });
+  });
+}
+
 function deps(fetchImpl: unknown) {
   return { fetch: fetchImpl as typeof fetch, now: () => NOW };
 }
 
+function dispatchCall(fetchImpl: ReturnType<typeof github>) {
+  return fetchImpl.mock.calls.find(([u]) => String(u).endsWith("/dispatches")) as unknown as [string, RequestInit] | undefined;
+}
+
 describe("/gerrit/<secret>", () => {
-  it("dispatches a run to GitHub with a signed ticket", async () => {
-    const fetchImpl = vi.fn(async () => new Response(null, { status: 204 }));
+  it("dispatches a run to GitHub as the app, with a signed ticket", async () => {
+    const fetchImpl = github();
     const res = await handle(post("/gerrit/s3cret", event), env, deps(fetchImpl));
     expect(res.status).toBe(202);
-    expect(fetchImpl).toHaveBeenCalledOnce();
-    const [url, init] = fetchImpl.mock.calls[0] as unknown as [string, RequestInit];
+    const call = dispatchCall(fetchImpl);
+    expect(call).toBeDefined();
+    const [url, init] = call!;
     expect(url).toBe("https://api.github.com/repos/go-valkyrie/vali-scheme/dispatches");
-    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer ghp_test");
+    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer ghs_installation");
     const body = JSON.parse(init.body as string);
     expect(body.event_type).toBe("gerrit-verify");
     expect(body.client_payload.ref).toBe("refs/changes/07/7/1");
@@ -91,9 +118,15 @@ describe("/gerrit/<secret>", () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it("returns 502 when GitHub refuses, so Gerrit retries", async () => {
-    const fetchImpl = vi.fn(async () => new Response("Bad credentials", { status: 401 }));
+  it("returns 502 when GitHub refuses the dispatch, so Gerrit retries", async () => {
+    const res = await handle(post("/gerrit/s3cret", event), env, deps(github(401)));
+    expect(res.status).toBe(502);
+  });
+
+  it("returns 502 when the app can't get a token", async () => {
+    const fetchImpl = vi.fn(async () => new Response("Not Found", { status: 404 }));
     const res = await handle(post("/gerrit/s3cret", event), env, deps(fetchImpl));
     expect(res.status).toBe(502);
+    expect(await res.text()).toMatch(/could not authenticate to GitHub/);
   });
 });

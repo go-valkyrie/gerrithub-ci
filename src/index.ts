@@ -16,6 +16,7 @@
 
 import { sameBytes, utf8 } from "./encoding";
 import { decide, type GerritEvent, type Policy, type Target } from "./gerrit";
+import { apiHeaders, installationToken } from "./github";
 import { TokenError, verifyGithubToken, type GithubClaims } from "./oidc";
 import { openTicket, signTicket } from "./ticket";
 
@@ -24,8 +25,9 @@ export interface Env {
   WEBHOOK_SECRET: string;
   /** Key that signs tickets. */
   TICKET_SECRET: string;
-  /** GitHub token allowed to create repository_dispatch events on the target repositories. */
-  GITHUB_TOKEN: string;
+  /** The GitHub App that sends repository_dispatch: its ID, and its private key (PEM). */
+  GITHUB_APP_ID: string;
+  GITHUB_APP_PRIVATE_KEY: string;
   /** Gerrit account the Worker votes as, and its HTTP password. */
   GERRIT_USER: string;
   GERRIT_HTTP_PASSWORD: string;
@@ -84,15 +86,15 @@ async function dispatch(env: Env, repo: string, target: Target, deps: Deps): Pro
     },
     env.TICKET_SECRET,
   );
+  const token = await installationToken(
+    repo,
+    { appId: env.GITHUB_APP_ID, privateKey: env.GITHUB_APP_PRIVATE_KEY },
+    deps.fetch,
+    deps.now(),
+  );
   return deps.fetch(`https://api.github.com/repos/${repo}/dispatches`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${env.GITHUB_TOKEN}`,
-      Accept: "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28",
-      "User-Agent": "gerrithub-ci",
-      "Content-Type": "application/json",
-    },
+    headers: { ...apiHeaders(token), "Content-Type": "application/json" },
     // client_payload may have at most 10 top-level properties.
     body: JSON.stringify({
       event_type: env.EVENT_TYPE || "gerrit-verify",
@@ -136,7 +138,13 @@ async function handleGerrit(request: Request, env: Env, deps: Deps): Promise<Res
   }
 
   const repo = policy.projects[decision.target.project];
-  const response = await dispatch(env, repo, decision.target, deps);
+  let response: Response;
+  try {
+    response = await dispatch(env, repo, decision.target, deps);
+  } catch (e) {
+    // 502, so the webhooks plugin retries once GitHub or the app is reachable.
+    return text(`could not authenticate to GitHub: ${(e as Error).message}`, 502);
+  }
   if (!response.ok) {
     // 502, so the webhooks plugin retries.
     const detail = await response.text().catch(() => "");

@@ -11,7 +11,8 @@ const REVISION = "0123456789abcdef0123456789abcdef01234567";
 const env: Env = {
   WEBHOOK_SECRET: "s3cret",
   TICKET_SECRET: "ticket-key",
-  GITHUB_TOKEN: "ghp_test",
+  GITHUB_APP_ID: "12345",
+  GITHUB_APP_PRIVATE_KEY: "unused here",
   GERRIT_USER: "ci-bot",
   GERRIT_HTTP_PASSWORD: "gerrit-pass",
   PROJECTS: JSON.stringify({ [REPO]: REPO }),
