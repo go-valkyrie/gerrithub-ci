@@ -60,7 +60,7 @@ export interface Policy {
 const REF = /^refs\/changes\/\d{2}\/\d+\/\d+$/;
 const REVISION = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 // A review comment reads "Patch Set N:\n\nrecheck" or "Patch Set N: Code-Review+1\n\nrecheck".
-const RECHECK = /^\s*recheck\s*$/im;
+export const RECHECK = /^\s*recheck\s*$/im;
 
 function projectOf(event: GerritEvent): string | undefined {
   if (event.change?.project) return event.change.project;

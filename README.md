@@ -24,6 +24,13 @@ GerritHub ── webhook ──▶ Worker ── repository_dispatch + ticket �
 - **Other events, and projects missing from `PROJECTS`,** are acknowledged and ignored with a 200, so Gerrit doesn't retry them.
 - **If GitHub refuses the dispatch,** the Worker answers 502, so the webhooks plugin retries.
 
+**Events are confirmed with Gerrit.** The webhooks plugin can't sign its requests, so an event is only a hint. Before dispatching, the Worker fetches the change from Gerrit's REST API as the bot account, and checks the event against it:
+- **The patch set:** the revision, patch set number, ref and project must all match the event.
+- **For a new patch set:** Gerrit's record of the uploader must be trusted.
+- **For a recheck:** Gerrit must show a trusted reviewer's `recheck` on that patch set.
+
+Someone who learned the webhook URL could only make the Worker re-check real events; they couldn't get CI to run untrusted code, or the bot to vote on it. Events Gerrit doesn't confirm are ignored with a 200. If Gerrit can't be reached, the Worker answers 502, so the webhook is retried.
+
 In the workflow, the job that runs the change's code gets no secrets and can't request an OIDC token. Only the `vote` job has `id-token: write`.
 
 ## Set up
@@ -45,7 +52,7 @@ In the workflow, the job that runs the change's code gets no secrets and can't r
    npx wrangler secret put GITHUB_APP_ID         # the App ID from step 1
    npx wrangler secret put GITHUB_APP_PRIVATE_KEY < app.pem   # the key from step 1
    npx wrangler secret put PROJECTS              # e.g. {"go-valkyrie/vali-scheme": "go-valkyrie/vali-scheme"}
-   npx wrangler secret put TRUSTED               # e.g. ["your-gerrit-username"]
+   npx wrangler secret put TRUSTED               # e.g. ["your-gerrit-username"]; prefer usernames, as Gerrit may hide emails
    npx wrangler secret put WEBHOOK_SECRET        # a long random string
    npx wrangler secret put TICKET_SECRET         # another long random string
    npx wrangler secret put GERRIT_USER           # the GerritHub bot account
@@ -61,6 +68,7 @@ In the workflow, the job that runs the change's code gets no secrets and can't r
      url = https://gerrithub-ci.<account>.workers.dev/gerrit/<WEBHOOK_SECRET>
      event = patchset-created
      event = comment-added
+     sslVerify = true
    ```
 
    ```sh
@@ -69,7 +77,10 @@ In the workflow, the job that runs the change's code gets no secrets and can't r
    git push origin HEAD:refs/meta/config
    ```
 
-   The plugin can't send an auth header, so the secret is part of the URL. Treat the URL as a secret.
+   The plugin can't send an auth header, so the secret is part of the URL.
+   - **Keep it private:** by default only project owners and Gerrit administrators can read `refs/meta/config`. Check that the project's Access page grants no **Read** on `refs/meta/config` to Registered or Anonymous Users.
+   - **`sslVerify = true` matters:** GerritHub's default is false, so without it the URL could be sent to an impostor.
+   - **If it leaks:** change `WEBHOOK_SECRET` and the `url` together. Since events are confirmed with Gerrit, a leaked URL can't run untrusted code in the meantime.
 
 4. **Add a `Verified` label** to the project's `project.config` on `refs/meta/config`, if it doesn't have one. Grant the bot account permission to vote it.
 
