@@ -1,0 +1,14 @@
+[tools]
+node = "24"
+
+[tasks.check]
+description = "Type-check and run the tests"
+run = ["npm run typecheck", "npm test"]
+
+[tasks.dev]
+description = "Run the Worker locally (secrets from .dev.vars)"
+run = "npx wrangler dev"
+
+[tasks.deploy]
+description = "Deploy the Worker"
+run = "npx wrangler deploy"

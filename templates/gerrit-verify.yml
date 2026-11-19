@@ -1,0 +1,66 @@
+# Copy to .github/workflows/gerrit-verify.yml in the GitHub repository that
+# GerritHub mirrors, on its default branch. The gerrithub-ci Worker sends it a
+# repository_dispatch for each patch set to verify.
+#
+# This workflow holds no GerritHub credentials. The `vote` job proves who it
+# is to the Worker with its GitHub Actions OIDC token, and the Worker votes
+# Verified with its own Gerrit account. Only that job may request a token;
+# the `verify` job runs the change's code and gets neither secrets nor a token.
+#
+# Set the repository variable GERRITHUB_CI_URL to the Worker's URL, for
+# example https://gerrithub-ci.<account>.workers.dev.
+
+name: gerrit-verify
+
+on:
+  repository_dispatch:
+    types: [gerrit-verify]
+
+permissions:
+  contents: read
+
+env:
+  GERRIT_URL: https://review.gerrithub.io
+  PROJECT: ${{ github.event.client_payload.project }}
+  REF: ${{ github.event.client_payload.ref }}
+  REVISION: ${{ github.event.client_payload.revision }}
+
+concurrency:
+  group: gerrit-${{ github.event.client_payload.change }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify ${{ github.event.client_payload.change }},${{ github.event.client_payload.patchset }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the patch set
+        run: |
+          case "$REF" in refs/changes/[0-9][0-9]/*/*) ;; *) echo "bad ref: $REF"; exit 1 ;; esac
+          git init -q .
+          git fetch -q --depth=1 "$GERRIT_URL/$PROJECT" "$REF"
+          git checkout -q FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$REVISION"
+
+      # Replace with the repository's own checks, e.g. `bin/mise run check`.
+      - name: Check
+        run: echo "run the checks here"
+
+  vote:
+    needs: verify
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Report the result to gerrithub-ci
+        env:
+          RESULT: ${{ needs.verify.result }}
+          TICKET: ${{ github.event.client_payload.ticket }}
+          WORKER: ${{ vars.GERRITHUB_CI_URL }}
+        run: |
+          token=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=gerrithub-ci" | jq -r .value)
+          jq -n --arg ticket "$TICKET" --arg result "$RESULT" '{ticket: $ticket, result: $result}' |
+          curl -fsS -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+            --data @- "$WORKER/vote"

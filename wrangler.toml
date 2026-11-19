@@ -1,0 +1,22 @@
+name = "gerrithub-ci"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+
+[vars]
+# Gerrit project name -> GitHub "owner/repo" to send repository_dispatch to.
+PROJECTS = '{"go-valkyrie/vali-scheme": "go-valkyrie/vali-scheme"}'
+# Gerrit usernames or emails whose patch sets run CI without a "recheck".
+TRUSTED = '[]'
+# Optional, with their defaults:
+# GERRIT_URL = "https://review.gerrithub.io"
+# EVENT_TYPE = "gerrit-verify"
+# OIDC_AUDIENCE = "gerrithub-ci"
+# WORKFLOW = ".github/workflows/gerrit-verify.yml"   # the only workflow allowed to vote
+# BRANCH = "main"                                    # ...and the branch it must run from
+
+# Secrets, set with `npx wrangler secret put NAME`:
+#   WEBHOOK_SECRET        the path segment GerritHub posts to (/gerrit/<secret>)
+#   TICKET_SECRET         signs the ticket each dispatch carries and each vote returns
+#   GITHUB_TOKEN          fine-grained token with Contents: read and write on the target repositories
+#   GERRIT_USER           the GerritHub bot account that votes Verified
+#   GERRIT_HTTP_PASSWORD  its HTTP password

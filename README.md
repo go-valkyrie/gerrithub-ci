@@ -1,0 +1,76 @@
+# gerrithub-ci
+
+A Cloudflare Worker that runs GitHub Actions for changes under review on [GerritHub](https://review.gerrithub.io), and votes `Verified` on them. GitHub holds no GerritHub credentials.
+
+```text
+GerritHub ── webhook ──▶ Worker ── repository_dispatch + ticket ──▶ GitHub Actions
+    ▲                     ▲  │                                        │
+    │                     │  └─ verifies the OIDC token and ticket ◀──┤ vote job: result + ticket,
+    └──── Verified ±1 ────┘     (Worker's own Gerrit account)          │ signed in with GitHub OIDC
+```
+
+- **`POST /gerrit/<WEBHOOK_SECRET>`:** GerritHub's `webhooks` plugin posts its events here. The Worker decides which events should run CI. It sends `repository_dispatch` to the GitHub repository GerritHub mirrors, with a **ticket**: an HMAC-signed record of the project, change, patch set, revision and repository.
+- **`POST /vote`:** the workflow's `vote` job posts its result and the ticket here, with a GitHub Actions OIDC token as its bearer token. The Worker votes only if three things check out:
+  - The token is signed by GitHub and meant for this Worker: its issuer, audience and expiry are checked.
+  - The token comes from the expected workflow file, on the expected branch, in the repository the ticket names, from a `repository_dispatch` run.
+  - The ticket is one the Worker signed, less than 12 hours ago.
+
+  It then votes with its own Gerrit account. A valid token can't vote on a change the Worker didn't send to CI. Only the trusted workflow on the default branch can vote at all.
+
+## What runs
+
+- **A new patch set** runs when its uploader is in `TRUSTED`.
+- **Anyone else's patch set** runs when a trusted reviewer comments `recheck` on it. Untrusted code never reaches CI unless a maintainer asks for it.
+- **Other events, and projects missing from `PROJECTS`,** are acknowledged and ignored with a 200, so Gerrit doesn't retry them.
+- **If GitHub refuses the dispatch,** the Worker answers 502, so the webhooks plugin retries.
+
+In the workflow, the job that runs the change's code gets no secrets and can't request an OIDC token. Only the `vote` job has `id-token: write`.
+
+## Set up
+
+1. **Deploy the Worker.** Edit `PROJECTS` and `TRUSTED` in `wrangler.toml` first.
+
+   ```sh
+   mise install          # Node, from mise.toml
+   npm ci
+   npx wrangler secret put WEBHOOK_SECRET        # a long random string
+   npx wrangler secret put TICKET_SECRET         # another long random string
+   npx wrangler secret put GITHUB_TOKEN          # fine-grained token: Contents read and write on the mirror
+   npx wrangler secret put GERRIT_USER           # the GerritHub bot account
+   npx wrangler secret put GERRIT_HTTP_PASSWORD  # its HTTP password
+   npx wrangler deploy
+   ```
+
+2. **Point GerritHub at it.** As project owner, add `webhooks.config` to the project's `refs/meta/config`:
+
+   ```ini
+   [remote "gerrithub-ci"]
+     url = https://gerrithub-ci.<account>.workers.dev/gerrit/<WEBHOOK_SECRET>
+     event = patchset-created
+     event = comment-added
+   ```
+
+   ```sh
+   git fetch origin refs/meta/config:meta-config && git checkout meta-config
+   # add webhooks.config, commit
+   git push origin HEAD:refs/meta/config
+   ```
+
+   The plugin can't send an auth header, so the secret is part of the URL. Treat the URL as a secret.
+
+3. **Add a `Verified` label** to the project's `project.config` on `refs/meta/config`, if it doesn't have one. Grant the bot account permission to vote it.
+
+4. **Add the workflow.** Copy `templates/gerrit-verify.yml` to `.github/workflows/` on the mirror's default branch, and replace its `Check` step with the repository's checks. Set the repository variable `GERRITHUB_CI_URL` to the Worker's URL. It's a variable, not a secret.
+
+   The Worker accepts votes only from that workflow file on that branch. To change either, set `WORKFLOW` or `BRANCH` in `wrangler.toml`.
+
+## Develop
+
+```sh
+mise run check   # type-check and test
+mise run dev     # wrangler dev; put secrets in .dev.vars
+```
+
+## Licence
+
+MIT
