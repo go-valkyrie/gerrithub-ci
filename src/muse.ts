@@ -10,15 +10,18 @@
 //   2. /v1/*: a transparent proxy to the LLM's API. It accepts only the
 //      ephemeral token, swaps in the real LLM key, and streams the request
 //      and response bodies through untouched (SSE included).
-//   3. POST /github-webhook: GitHub's workflow_job events, HMAC-signed.
-//      The Worker tracks each job forward-only (queued -> in_progress ->
-//      completed) and revokes the run's tokens when its job completes.
-//      The token's own expiry stays enforced as a backstop.
+//   3. POST /github-webhook: GitHub's workflow_job and workflow_run events,
+//      HMAC-signed. Jobs are tracked forward-only (queued -> in_progress ->
+//      completed); when the run completes, its tokens are revoked and its
+//      state deleted. The token's own expiry stays enforced as a backstop.
+// All of a patch set's state — deduplicated deliveries, its runs' jobs,
+// revocation — lives in one PatchSet Durable Object (see below).
 //
 // Nothing here logs keys, tokens, prompts, reviews or diffs: the proxy
 // never reads a body into memory, and handlers log only ids and statuses.
 
 import { fromBase64Url, fromUtf8, sameBytes, toBase64Url, utf8 } from "./encoding";
+import type { GerritEvent, Target } from "./gerrit";
 
 /** How long an ephemeral token lasts, in seconds; the revocation list is only an addition. */
 export const MUSE_TOKEN_TTL_SECONDS = 1800;
@@ -136,35 +139,55 @@ export async function verifyMuseToken(token: string, secret: string, now: number
   return claims;
 }
 
-// --- per-run token state ----------------------------------------------------------
+// --- PatchSet: one Durable Object per patch set ----------------------------------
 // A module-level Map would be per-isolate: a revocation written on one
-// isolate is invisible to the rest. So each run's state lives in a Durable
-// Object named after the run: every delivery of its jobs' events reaches the
-// same instance, and revoking is one storage write next to the job's marker.
-// Entries expire with the token lifetime; the token's own expiry is the
-// backstop when the completion event never arrives.
+// isolate is invisible to the rest. So a patch set's state lives in a Durable
+// Object: every delivery of its events reaches the same instance.
+//
+// One class serves two key spaces, since a webhook event carries only a run
+// id and no patch set to route by: instances named `ps:<project>~<change
+// number>/<patch set number>` de-duplicate Gerrit deliveries, and instances
+// named `run:<run id>` track that run's jobs and revocation. Entries expire
+// with the token lifetime; the token's own expiry is the backstop when a
+// completion event never arrives.
 
-/** The parts of DurableObjectStorage that per-run token state uses. */
-export interface TokenStorage {
+/** How long a claimed delivery is remembered, in seconds. */
+export const DEFAULT_WINDOW_SECONDS = 600;
+
+/** The parts of DurableObjectStorage that a patch set's state uses. */
+export interface PatchSetStorage {
   get(key: string): Promise<unknown>;
   put(key: string, value: unknown, opts?: { expirationTtl?: number }): Promise<void>;
+  delete(key: string): Promise<boolean>;
+  list(opts: { prefix: string }): Promise<Map<string, unknown>>;
 }
 
-/** Progress of one workflow_job delivery. */
+/** Progress of one workflow_job delivery, or of a run's completion. */
 export type JobProgress = "advanced" | "stale" | "unknown";
 
 const JOB_ORDER: Record<string, number> = { queued: 0, in_progress: 1, completed: 2 };
 
 /**
- * One run's review-token state. Forward-only per job: an event at or behind
- * the latest seen state is a duplicate or a stale redelivery and changes
- * nothing. A genuine completion revokes the run's tokens in the same write.
+ * A patch set's deliveries, or one run's jobs and revocation. Forward-only
+ * per key: an event at or behind the latest seen state is a duplicate or a
+ * stale redelivery and changes nothing.
  *
  * A plain class with a `fetch` method rather than an RPC `DurableObject`
  * subclass, so tests can build it without the Workers runtime.
  */
-export class MuseTokens {
-  constructor(private readonly state: { storage: TokenStorage }) {}
+export class PatchSet {
+  constructor(private readonly state: { storage: PatchSetStorage }) {}
+
+  /**
+   * Claims a Gerrit delivery: true the first time, false for repeats.
+   * The marker expires after `windowSeconds`, like the claim itself would.
+   */
+  async claimEvent(key: string, windowSeconds: number): Promise<boolean> {
+    const full = `event:${key}`;
+    if ((await this.state.storage.get(full)) !== undefined) return false;
+    await this.state.storage.put(full, true, { expirationTtl: windowSeconds });
+    return true;
+  }
 
   /** Records a delivery of one of the run's jobs. */
   async noteJob(jobId: string, action: string, ttlSeconds: number): Promise<JobProgress> {
@@ -174,19 +197,44 @@ export class MuseTokens {
     const prev = await this.state.storage.get(key);
     if (typeof prev === "number" && rank <= prev) return "stale";
     await this.state.storage.put(key, rank, { expirationTtl: ttlSeconds });
-    if (action === "completed") {
-      await this.state.storage.put("revoked", true, { expirationTtl: ttlSeconds });
+    return "advanced";
+  }
+
+  /**
+   * Completes the run: revokes its tokens and deletes its job markers, so
+   * redelivered completions report "stale" instead of logging twice. The
+   * revoked flag itself stays, expiring with the TTL, so stragglers fail
+   * closed.
+   */
+  async completeRun(ttlSeconds: number): Promise<"advanced" | "stale"> {
+    if ((await this.state.storage.get("done")) !== undefined) return "stale";
+    await this.state.storage.put("revoked", true, { expirationTtl: ttlSeconds });
+    await this.state.storage.put("done", true, { expirationTtl: ttlSeconds });
+    for (const key of (await this.state.storage.list({ prefix: "job:" })).keys()) {
+      await this.state.storage.delete(key);
     }
     return "advanced";
   }
 
-  /** Whether a completed job revoked the run's tokens. */
+  /** Whether the run's tokens were revoked. */
   async isRevoked(): Promise<boolean> {
     return (await this.state.storage.get("revoked")) !== undefined;
   }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
+    if (request.method === "POST" && url.pathname === "/claim") {
+      let claim: { key?: unknown; windowSeconds?: unknown };
+      try {
+        claim = (await request.json()) as typeof claim;
+      } catch {
+        return Response.json({ error: "body is not JSON" }, { status: 400 });
+      }
+      if (typeof claim.key !== "string" || typeof claim.windowSeconds !== "number") {
+        return Response.json({ error: "bad claim" }, { status: 400 });
+      }
+      return Response.json({ claimed: await this.claimEvent(claim.key, claim.windowSeconds) });
+    }
     if (request.method === "POST" && url.pathname === "/note") {
       let note: { jobId?: unknown; action?: unknown; ttl?: unknown };
       try {
@@ -199,6 +247,16 @@ export class MuseTokens {
       }
       return Response.json({ progress: await this.noteJob(note.jobId, note.action, note.ttl) });
     }
+    if (request.method === "POST" && url.pathname === "/complete") {
+      let done: { ttl?: unknown };
+      try {
+        done = (await request.json()) as typeof done;
+      } catch {
+        return Response.json({ error: "body is not JSON" }, { status: 400 });
+      }
+      if (typeof done.ttl !== "number") return Response.json({ error: "bad completion" }, { status: 400 });
+      return Response.json({ progress: await this.completeRun(done.ttl) });
+    }
     if (request.method === "GET" && url.pathname === "/revoked") {
       return Response.json({ revoked: await this.isRevoked() });
     }
@@ -206,31 +264,85 @@ export class MuseTokens {
   }
 }
 
-/** Per-run token state, addressed by run. */
-export interface MuseTokensClient {
+/** A patch set's state, addressed by patch set for deliveries and by run for jobs. */
+export interface PatchSetClient {
+  claimEvent(project: string, change: number, patchset: number, key: string, windowSeconds: number): Promise<boolean>;
   noteJob(runId: string, jobId: string, action: string, ttlSeconds: number): Promise<JobProgress>;
   isRevoked(runId: string): Promise<boolean>;
+  completeRun(runId: string, ttlSeconds: number): Promise<"advanced" | "stale">;
 }
 
-/** A client that reaches the Durable Object named after the run. */
-export function tokensFor(namespace: DurableObjectNamespace): MuseTokensClient {
-  const stub = (runId: string) => namespace.get(namespace.idFromName(`muse-run:${runId}`));
+/** The object name for a patch set's deliveries. */
+export function patchsetName(project: string, change: number, patchset: number): string {
+  return `ps:${project}~${change}/${patchset}`;
+}
+
+/** The object name for a run's jobs and revocation. */
+export function runName(runId: string): string {
+  return `run:${runId}`;
+}
+
+/** A client that reaches the patch set's object for deliveries and the run's for jobs. */
+export function patchSetsFor(namespace: DurableObjectNamespace): PatchSetClient {
+  const stub = (name: string) => namespace.get(namespace.idFromName(name));
+  async function post<T>(name: string, path: string, body: unknown): Promise<T> {
+    const res = await stub(name).fetch(`https://patchset.invalid${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`patch set store returned ${res.status}`);
+    return (await res.json()) as T;
+  }
   return {
-    noteJob: async (runId, jobId, action, ttlSeconds) => {
-      const res = await stub(runId).fetch("https://tokens.invalid/note", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jobId, action, ttl: ttlSeconds }),
-      });
-      if (!res.ok) throw new Error(`token store returned ${res.status}`);
-      return ((await res.json()) as { progress: JobProgress }).progress;
-    },
+    claimEvent: async (project, change, patchset, key, windowSeconds) =>
+      (await post<{ claimed: boolean }>(patchsetName(project, change, patchset), "/claim", { key, windowSeconds })).claimed,
+    noteJob: async (runId, jobId, action, ttlSeconds) =>
+      (await post<{ progress: JobProgress }>(runName(runId), "/note", { jobId, action, ttl: ttlSeconds })).progress,
     isRevoked: async (runId) => {
-      const res = await stub(runId).fetch("https://tokens.invalid/revoked");
-      if (!res.ok) throw new Error(`token store returned ${res.status}`);
+      const res = await stub(runName(runId)).fetch("https://patchset.invalid/revoked");
+      if (!res.ok) throw new Error(`patch set store returned ${res.status}`);
       return ((await res.json()) as { revoked: boolean }).revoked === true;
     },
+    completeRun: async (runId, ttlSeconds) =>
+      (await post<{ progress: "advanced" | "stale" }>(runName(runId), "/complete", { ttl: ttlSeconds })).progress,
   };
+}
+
+// --- delivery keys --------------------------------------------------------------
+// One Gerrit event arrives about five times (one per Gerrit node), so each
+// delivery is claimed in the patch set's object before any work happens.
+
+function who(account: GerritEvent["author"]): string {
+  return (account?.username ?? account?.email ?? account?.name ?? "").toLowerCase();
+}
+
+/**
+ * The key that identifies one Gerrit event, the same in every node's delivery
+ * of it and different from any other event.
+ *
+ * - A patch set is created once, so the type, project, change, patch set and
+ *   revision name the event. Nothing time-dependent is needed.
+ * - A comment-added event isn't unique to the patch set: the same reviewer can
+ *   comment "recheck" twice, and both must run. So a comment adds the author,
+ *   the comment text, and `eventCreatedOn`, the time Gerrit created the event
+ *   (seconds since the epoch). Gerrit stamps it when the event is created, and
+ *   events are forwarded to other nodes with the stamp intact, so every node
+ *   reports the same value. Two comments would need the same author, text and
+ *   second to collide.
+ *
+ * The Worker's own clock is deliberately not used: the deliveries arrive at
+ * different moments. The key is hashed, since comment text is unbounded.
+ */
+export async function eventKey(event: GerritEvent, target: Target): Promise<string> {
+  const parts = [event.type ?? "", target.project, String(target.change), String(target.patchset), target.revision];
+  if (event.type === "comment-added") {
+    parts.push(who(event.author), String(event.eventCreatedOn ?? ""), event.comment ?? "");
+  }
+  // JSON, so that no field can run into the next.
+  const bytes = new TextEncoder().encode(JSON.stringify(parts));
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function hexToBytes(hex: string): Uint8Array | undefined {

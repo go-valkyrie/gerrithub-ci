@@ -23,7 +23,7 @@ GerritHub ── webhook ──▶ Worker ── repository_dispatch + ticket �
 - **Anyone else's patch set** runs when a trusted reviewer comments `recheck` on it. Untrusted code never reaches CI unless a maintainer asks for it.
 - **Other events, and projects missing from `PROJECTS`,** are acknowledged and ignored with a 200, so Gerrit doesn't retry them.
 - **Events it will act on** are answered 202 at once; confirming and dispatching happen afterwards, in the background. The webhooks plugin retries any delivery slower than its socket timeout, and every retry would dispatch another run, so the Worker never makes it wait.
-- **Repeat deliveries are dropped.** GerritHub runs several Gerrit nodes and each node's webhooks plugin posts every event, so one event arrives about five times within a few seconds. Before confirming with Gerrit, the Worker claims the event in a Durable Object named after it (event type, project, change, patch set and revision, plus for a comment the author, the text and Gerrit's `eventCreatedOn` timestamp, so a second `recheck` later still runs). The first delivery proceeds and the rest are logged as duplicates and ignored. An object keeps its claim for 10 minutes, then deletes all its storage; set `DEDUPE_WINDOW_SECONDS` to change that. If the claim can't be made, the Worker dispatches anyway, since a duplicate run is better than none.
+- **Repeat deliveries are dropped.** GerritHub runs several Gerrit nodes and each node's webhooks plugin posts every event, so one event arrives about five times within a few seconds. Before confirming with Gerrit, the Worker claims the event in the patch set's Durable Object (one `PatchSet` object per patch set; the claim key holds the event type, project, change, patch set and revision, plus for a comment the author, the text and Gerrit's `eventCreatedOn` timestamp, so a second `recheck` later still runs). The first delivery proceeds and the rest are logged as duplicates and ignored. Each claim expires after 10 minutes; set `DEDUPE_WINDOW_SECONDS` to change that. If the claim can't be made, the Worker dispatches anyway, since a duplicate run is better than none.
 - **If Gerrit or GitHub fails,** the Worker retries twice itself, after 1 and 4 seconds, then gives up. A GitHub client error other than 429 isn't retried. The outcome of each event is in the Worker's logs (`npx wrangler tail`, or the dashboard under Workers → gerrithub-ci → Logs), and a maintainer can comment `recheck` to try again.
 
 **Events are confirmed with Gerrit.** The webhooks plugin can't sign its requests, so an event is only a hint. Before dispatching, the Worker fetches the change from Gerrit's REST API as the bot account, and checks the event against it:
@@ -43,17 +43,18 @@ A review job can ask an LLM to review the patch set without ever holding the LLM
 review job ── OIDC + ticket ──▶ POST /muse-token ── ephemeral token (30 min, this ticket only)
 review job ── ephemeral token ─▶ /v1/* ──▶ LLM API (Worker swaps in LLM_API_KEY, streams SSE back)
 review job ── OIDC + ticket ──▶ POST /review {review, codeReview} ──▶ Gerrit setReview
-GitHub ── workflow_job events ─▶ POST /github-webhook ── completed revokes the run's tokens
+GitHub ── workflow_job events ─▶ POST /github-webhook ── tracked forward-only
+GitHub ── workflow_run completed ─▶ POST /github-webhook ── run's tokens revoked, state deleted
 ```
 
 - **`POST /muse-token`:** like `/vote`, it checks the OIDC token (issuer, audience, expiry) and that the token's workflow and repository match the ticket. It answers `{token, expires_in, expires_at}`. The token is bound to the repo, ticket, change, patch set and run, and dies with its own expiry whatever else happens.
 - **`/v1/*`:** forwards any method, path and query to `LLM_BASE_URL` (default `https://api.meta.ai/v1`), replacing the caller's bearer token with `LLM_API_KEY`. Request and response bodies stream through untouched, so SSE works. It accepts only ephemeral tokens; a GitHub OIDC token is rejected. Without `LLM_API_KEY` it answers 501.
-- **`POST /github-webhook`:** GitHub `workflow_job` webhook events, checked against `GITHUB_WEBHOOK_SECRET` (`X-Hub-Signature-256`). Each job is tracked forward-only (`queued` → `in_progress` → `completed`) in a Durable Object named after the run, so every isolate sees the same state; when a job completes, its run's tokens are revoked in the same write. Retried or out-of-order deliveries change nothing.
+- **`POST /github-webhook`:** GitHub `workflow_job` and `workflow_run` webhook events, checked against `GITHUB_WEBHOOK_SECRET` (`X-Hub-Signature-256`). Each run's jobs are tracked forward-only (`queued` → `in_progress` → `completed`) in a Durable Object named after the run, so every isolate sees the same state. When the run completes, its tokens are revoked and its state deleted — revocation waits for the run, not a job, because the review job runs after the verify job and revoking early would lock it out of the proxy. Retried or out-of-order deliveries change nothing. Every entry expires with the token lifetime anyway, so a missed completion can't linger.
 - **`POST /review`:** like `/vote`, it checks the OIDC token and ticket, then posts `review` markdown to the ticket's revision with `setReview`. It votes `Code-Review +1` only when the body says `"codeReview": true`.
 
 The Worker never logs keys, tokens, prompts, reviews or diffs — the proxy never reads a body, and the webhook log names only the run and job.
 
-To use it, set `LLM_API_KEY` (and `GITHUB_WEBHOOK_SECRET`, plus a `workflow_job` webhook on the mirror repository pointing at `/github-webhook`), and give the review job `id-token: write`. It mints its token like the `vote` job does, then calls the LLM through `$WORKER/v1/...` and posts the result:
+To use it, set `LLM_API_KEY` (and `GITHUB_WEBHOOK_SECRET`, plus a webhook on the mirror repository pointing at `/github-webhook`, subscribed to `Workflow jobs` and `Workflow runs`), and give the review job `id-token: write`. It mints its token like the `vote` job does, then calls the LLM through `$WORKER/v1/...` and posts the result:
 
 ```yaml
   review:

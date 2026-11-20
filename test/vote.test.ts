@@ -9,8 +9,7 @@ const REPO = "go-valkyrie/vali-scheme";
 const REVISION = "0123456789abcdef0123456789abcdef01234567";
 
 const env: Env = {
-  EVENT_CLAIM: undefined as unknown as DurableObjectNamespace,
-  MUSE_TOKENS: undefined as unknown as DurableObjectNamespace,
+  PATCHSET: undefined as unknown as DurableObjectNamespace,
   WEBHOOK_SECRET: "s3cret",
   TICKET_SECRET: "ticket-key",
   GITHUB_APP_ID: "12345",
@@ -76,7 +75,13 @@ async function vote(opts: { token?: string; ticket?: string; result?: string; fe
     headers,
     body: JSON.stringify({ ticket: opts.ticket ?? (await signTicket(ticketFields, env.TICKET_SECRET)), result: opts.result ?? "success" }),
   });
-  const res = await handle(req, opts.env ?? env, { fetch: fetchImpl as unknown as typeof fetch, now: () => NOW, waitUntil: () => {}, sleep: async () => {}, log: () => {}, claim: async () => true, museTokens: { noteJob: async () => "advanced", isRevoked: async () => false } });
+  const patchSets = {
+    claimEvent: async () => true,
+    noteJob: async () => "advanced" as const,
+    isRevoked: async () => false,
+    completeRun: async () => "advanced" as const,
+  };
+  const res = await handle(req, opts.env ?? env, { fetch: fetchImpl as unknown as typeof fetch, now: () => NOW, waitUntil: () => {}, sleep: async () => {}, log: () => {}, patchSets });
   return { res, fetchImpl };
 }
 

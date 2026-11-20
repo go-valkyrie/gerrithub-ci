@@ -23,41 +23,40 @@
 //   short-lived token above, and streams the answer through.
 //
 // POST /github-webhook
-//   GitHub's workflow_job events, HMAC-signed. Revokes a run's tokens when
-//   its job completes.
+//   GitHub's workflow_job and workflow_run events, HMAC-signed. Jobs are
+//   tracked forward-only; when the run completes, its tokens are revoked
+//   and its state deleted.
 //
 // POST /review
 //   Like /vote, but posts review markdown to Gerrit, adding Code-Review +1
 //   only when asked.
 
-import { claimerFor, eventKey, type Claimer } from "./claims";
 import { sameBytes, utf8 } from "./encoding";
 import { decide, type GerritEvent, type Policy, type Target } from "./gerrit";
 import { apiHeaders, installationToken } from "./github";
 import {
   DEFAULT_LLM_BASE_URL,
+  DEFAULT_WINDOW_SECONDS,
   MUSE_TOKEN_TTL_SECONDS,
   MuseTokenError,
+  eventKey,
+  patchSetsFor,
   proxyToLlm,
   signMuseToken,
-  tokensFor,
   verifyMuseToken,
   verifyWebhookSignature,
   type JobProgress,
-  type MuseTokensClient,
+  type PatchSetClient,
 } from "./muse";
 import { confirmChange, fetchChange } from "./verify";
 import { TokenError, verifyGithubToken, type GithubClaims } from "./oidc";
 import { openTicket, signTicket, type Ticket } from "./ticket";
 
-export { EventClaim } from "./claims";
-export { MuseTokens } from "./muse";
+export { PatchSet } from "./muse";
 
 export interface Env {
-  /** Durable Object namespace that de-duplicates deliveries; see src/claims.ts. */
-  EVENT_CLAIM: DurableObjectNamespace;
-  /** Durable Object namespace that tracks review-token state per run; see src/muse.ts. */
-  MUSE_TOKENS: DurableObjectNamespace;
+  /** Durable Object namespace holding each patch set's state; see src/muse.ts. */
+  PATCHSET: DurableObjectNamespace;
   /** How long an event is remembered, in seconds; defaults to 600. */
   DEDUPE_WINDOW_SECONDS?: string;
   /** Secret path segment GerritHub posts to. */
@@ -107,16 +106,13 @@ export interface Deps {
   sleep: (ms: number) => Promise<void>;
   /** Where background work reports what it did: the Worker's logs. */
   log: (line: string) => void;
-  /** Claims an event key: true for the first delivery of an event, false for repeats. */
-  claim: Claimer;
-  /** Per-run review-token state: job progress and revocation. */
-  museTokens: MuseTokensClient;
+  /** A patch set's deliveries and its runs' jobs, revocation and deletion. */
+  patchSets: PatchSetClient;
 }
 
 function depsFor(ctx: ExecutionContext, env: Env): Deps {
   return {
-    claim: claimerFor(env.EVENT_CLAIM),
-    museTokens: tokensFor(env.MUSE_TOKENS),
+    patchSets: patchSetsFor(env.PATCHSET),
     fetch: (...args) => fetch(...args),
     now: () => Math.floor(Date.now() / 1000),
     waitUntil: (work) => ctx.waitUntil(work),
@@ -213,6 +209,12 @@ async function handleGerrit(request: Request, env: Env, deps: Deps): Promise<Res
   return text(`accepted change ${change},${patchset} (${trigger}); confirming it with Gerrit`, 202);
 }
 
+/** How long a claimed delivery is remembered, in seconds. */
+function dedupeWindow(env: Env): number {
+  const seconds = Number(env.DEDUPE_WINDOW_SECONDS);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : DEFAULT_WINDOW_SECONDS;
+}
+
 /** A failure that retrying won't fix. */
 class Permanent extends Error {}
 
@@ -238,14 +240,20 @@ async function withRetries<T>(what: string, deps: Deps, attempt: () => Promise<T
 async function confirmAndDispatch(env: Env, policy: Policy, event: GerritEvent, hint: Target, deps: Deps): Promise<void> {
   const label = `change ${hint.change},${hint.patchset} (${hint.trigger})`;
   try {
-    // Every Gerrit node posts the event, so claim it before doing any work.
-    // This is after the cheap checks in decide(), so a forged event can at
-    // worst use up a key, and before the Gerrit call, so repeats cost nothing.
-    // If the claim itself fails, dispatch anyway: a duplicate run is better
-    // than none.
+    // Every Gerrit node posts the event, so claim it in the patch set's
+    // object before doing any work. This is after the cheap checks in
+    // decide(), so a forged event can at worst use up a key, and before the
+    // Gerrit call, so repeats cost nothing. If the claim itself fails,
+    // dispatch anyway: a duplicate run is better than none.
     let first = true;
     try {
-      first = await deps.claim(await eventKey(event, hint));
+      first = await deps.patchSets.claimEvent(
+        hint.project,
+        hint.change,
+        hint.patchset,
+        await eventKey(event, hint),
+        dedupeWindow(env),
+      );
     } catch (e) {
       deps.log(`could not claim ${label} (${(e as Error).message}); dispatching anyway`);
     }
@@ -479,7 +487,7 @@ async function handleProxy(request: Request, env: Env, deps: Deps): Promise<Resp
     return text("could not check the review token", 502);
   }
   try {
-    if (await deps.museTokens.isRevoked(runId)) return text("bad review token", 401, { "WWW-Authenticate": "Bearer" });
+    if (await deps.patchSets.isRevoked(runId)) return text("bad review token", 401, { "WWW-Authenticate": "Bearer" });
   } catch {
     return text("could not check the review token", 502);
   }
@@ -493,13 +501,19 @@ async function handleProxy(request: Request, env: Env, deps: Deps): Promise<Resp
 }
 
 // --- /github-webhook ------------------------------------------------------------
-// GitHub's workflow_job events. Only the job's forward progress matters:
-// queued -> in_progress -> completed. A completed job revokes its run's
-// review tokens; anything else only moves the job's marker.
+// GitHub's workflow_job and workflow_run events. Only forward progress
+// matters: jobs move queued -> in_progress -> completed, and a completed run
+// has its tokens revoked and its state deleted. Anything else only moves a
+// marker. Retried deliveries are answered 200 so GitHub stops retrying.
+//
+// Revocation happens on run completion, not job completion: the review job
+// runs after the verify job, so revoking when verify completes would lock the
+// review out of the proxy while the run is still going.
 
 interface WorkflowJobBody {
   action?: string;
   workflow_job?: { id?: number | string; run_id?: number | string };
+  workflow_run?: { id?: number | string };
 }
 
 async function handleGithubWebhook(request: Request, env: Env, deps: Deps): Promise<Response> {
@@ -515,25 +529,26 @@ async function handleGithubWebhook(request: Request, env: Env, deps: Deps): Prom
     return text("body is not JSON", 400);
   }
   // GitHub's ping when the webhook is created: acknowledge it and stop.
-  if (!body.workflow_job) return text("pong", 200);
-  const jobId = body.workflow_job.id;
+  if (!body.workflow_job && !body.workflow_run) return text("pong", 200);
   const action = body.action ?? "";
-  if (jobId === undefined) return text("ignored: no job", 200);
-  const runId = body.workflow_job.run_id;
-  if (runId === undefined) return text("ignored: no run", 200);
-  // Forward-only per job, and a genuine completion revokes the run's tokens
-  // in the same write, atomically. Retried deliveries are answered 200 so
-  // GitHub stops retrying.
-  let progress: JobProgress;
   try {
-    progress = await deps.museTokens.noteJob(String(runId), String(jobId), action, museTtl(env));
+    if (body.workflow_run) {
+      const runId = body.workflow_run.id;
+      if (runId === undefined) return text("ignored: no run", 200);
+      if (action !== "completed") return text(`run ${runId} ${action}: ignored`, 200);
+      const progress = await deps.patchSets.completeRun(String(runId), museTtl(env));
+      if (progress === "advanced") deps.log(`run ${runId} completed; revoked its review tokens`);
+      return text(`run ${runId} completed: ${progress}`, 200);
+    }
+    const jobId = body.workflow_job!.id;
+    if (jobId === undefined) return text("ignored: no job", 200);
+    const runId = body.workflow_job!.run_id;
+    if (runId === undefined) return text("ignored: no run", 200);
+    const progress: JobProgress = await deps.patchSets.noteJob(String(runId), String(jobId), action, museTtl(env));
+    return text(`job ${jobId} ${action}: ${progress}`, 200);
   } catch (e) {
-    return text(`token store failed: ${(e as Error).message}`, 502);
+    return text(`patch set store failed: ${(e as Error).message}`, 502);
   }
-  if (progress === "advanced" && action === "completed") {
-    deps.log(`run ${runId} completed; revoked its review tokens`);
-  }
-  return text(`job ${jobId} ${action}: ${progress}`, 200);
 }
 
 // --- routing ------------------------------------------------------------------

@@ -39,19 +39,13 @@ compatibility_date = "2026-11-01"
 [observability]
 enabled = true
 
-# De-duplicates the several deliveries of each event (see src/claims.ts). One
-# Durable Object per event, deleted after the window; SQLite-backed, so it
-# works on the Workers Free plan.
+# Holds each patch set's state (see src/muse.ts): one Durable Object per
+# patch set de-duplicates Gerrit deliveries, and one per run tracks that
+# run's jobs, revocation and deletion. SQLite-backed, so it works on the
+# Workers Free plan; entries expire, and a completed run deletes its state.
 [[durable_objects.bindings]]
-name = "EVENT_CLAIM"
-class_name = "EventClaim"
-
-# Tracks each run's review-token state (see src/muse.ts). One Durable Object
-# per run, named after it, so every isolate sees the same revocation; entries
-# expire with the token lifetime. SQLite-backed, like the claims above.
-[[durable_objects.bindings]]
-name = "MUSE_TOKENS"
-class_name = "MuseTokens"
+name = "PATCHSET"
+class_name = "PatchSet"
 
 [[migrations]]
 tag = "v1"
@@ -59,4 +53,4 @@ new_sqlite_classes = ["EventClaim"]
 
 [[migrations]]
 tag = "v2"
-new_sqlite_classes = ["MuseTokens"]
+new_sqlite_classes = ["PatchSet"]

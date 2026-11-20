@@ -2,7 +2,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { toBase64Url, utf8 } from "../src/encoding";
 import { handle, type Env } from "../src/index";
 import { GITHUB_ISSUER, resetKeyCache } from "../src/oidc";
-import { MuseTokens, sha256Hex, signMuseToken, verifyMuseToken, type MuseTokensClient, type TokenStorage } from "../src/muse";
+import { PatchSet, patchSetsFor, sha256Hex, signMuseToken, verifyMuseToken, type PatchSetClient, type PatchSetStorage } from "../src/muse";
 import { signTicket, type Ticket } from "../src/ticket";
 
 const NOW = 1_800_000_000;
@@ -12,8 +12,7 @@ const LLM_KEY = "llm-secret-key";
 const HOOK_SECRET = "hook-secret";
 
 const env: Env = {
-  EVENT_CLAIM: undefined as unknown as DurableObjectNamespace,
-  MUSE_TOKENS: undefined as unknown as DurableObjectNamespace,
+  PATCHSET: undefined as unknown as DurableObjectNamespace,
   WEBHOOK_SECRET: "s3cret",
   TICKET_SECRET: "ticket-key",
   GITHUB_APP_ID: "12345",
@@ -36,38 +35,41 @@ beforeAll(async () => {
 });
 
 /**
- * A stand-in for the Durable Object namespace: one MuseTokens instance per
- * run, shared by every client made from it — like isolates sharing the real
- * objects. A fresh namespace per test keeps tests isolated from each other.
+ * A stand-in for the Durable Object namespace: one PatchSet instance per
+ * object name, shared by every client made from it — like isolates sharing
+ * the real objects. A fresh namespace per test keeps tests isolated from
+ * each other. The real client and fetch router run on top, so the whole
+ * stack is exercised.
  */
 function memoryNamespace() {
-  const objects = new Map<string, MuseTokens>();
-  const at = (runId: string) => {
-    let o = objects.get(runId);
+  const objects = new Map<string, PatchSet>();
+  const at = (name: string) => {
+    let o = objects.get(name);
     if (!o) {
       const data = new Map<string, unknown>();
-      o = new MuseTokens({
-        storage: {
-          get: async (key: string) => data.get(key),
-          put: async (key: string, value: unknown) => void data.set(key, value),
-        },
-      });
-      objects.set(runId, o);
+      const storage: PatchSetStorage = {
+        get: async (key: string) => data.get(key),
+        put: async (key: string, value: unknown) => void data.set(key, value),
+        delete: async (key: string) => data.delete(key),
+        list: async ({ prefix }: { prefix: string }) => new Map([...data].filter(([k]) => k.startsWith(prefix))),
+      };
+      o = new PatchSet({ storage });
+      objects.set(name, o);
     }
     return o;
   };
-  const client = (): MuseTokensClient => ({
-    noteJob: (runId, jobId, action, ttl) => at(runId).noteJob(jobId, action, ttl),
-    isRevoked: (runId) => at(runId).isRevoked(),
-  });
-  return { client };
+  const namespace = {
+    idFromName: (name: string) => name,
+    get: (id: string) => ({ fetch: (input: RequestInfo | URL, init?: RequestInit) => at(id).fetch(new Request(input, init)) }),
+  } as unknown as DurableObjectNamespace;
+  return { client: patchSetsFor(namespace) };
 }
 
-let tokens: MuseTokensClient;
+let tokens: PatchSetClient;
 
 beforeEach(() => {
   resetKeyCache();
-  tokens = memoryNamespace().client();
+  tokens = memoryNamespace().client;
 });
 
 const goodClaims = {
@@ -114,7 +116,7 @@ function mockFetch(llmBody = "data: hello\n\ndata: world\n\n") {
   return { fetchImpl, gerritCalls, llmCalls };
 }
 
-function deps(fetchImpl: unknown, museTokens?: MuseTokensClient) {
+function deps(fetchImpl: unknown, patchSets?: PatchSetClient) {
   const logs: string[] = [];
   return {
     fetch: fetchImpl as typeof fetch,
@@ -122,8 +124,7 @@ function deps(fetchImpl: unknown, museTokens?: MuseTokensClient) {
     waitUntil: () => {},
     sleep: async () => {},
     log: (line: string) => void logs.push(line),
-    claim: async () => true,
-    museTokens: museTokens ?? tokens,
+    patchSets: patchSets ?? tokens,
     logs,
   };
 }
@@ -249,28 +250,39 @@ describe("ephemeral tokens", () => {
   });
 });
 
-describe("MuseTokens", () => {
+describe("PatchSet", () => {
   function recording() {
     const data = new Map<string, unknown>();
     const puts: { key: string; value: unknown; opts?: { expirationTtl?: number } }[] = [];
-    const storage: TokenStorage = {
+    const storage: PatchSetStorage = {
       get: async (key: string) => data.get(key),
       put: async (key: string, value: unknown, opts?: { expirationTtl?: number }) => {
         data.set(key, value);
         puts.push({ key, value, opts });
       },
+      delete: async (key: string) => data.delete(key),
+      list: async ({ prefix }: { prefix: string }) => new Map([...data].filter(([k]) => k.startsWith(prefix))),
     };
-    return { state: new MuseTokens({ storage }), puts };
+    return { data, state: new PatchSet({ storage }), puts };
   }
 
-  it("is forward-only per job, and revokes the run on a genuine completion", async () => {
+  it("claims each delivery key once, expiring with the window", async () => {
+    const { state, puts } = recording();
+    expect(await state.claimEvent("abc", 30)).toBe(true);
+    expect(await state.claimEvent("abc", 30)).toBe(false);
+    expect(await state.claimEvent("def", 30)).toBe(true);
+    expect(puts).toContainEqual({ key: "event:abc", value: true, opts: { expirationTtl: 30 } });
+  });
+
+  it("is forward-only per job, without revoking", async () => {
     const { state } = recording();
-    expect(await state.isRevoked()).toBe(false);
     expect(await state.noteJob("7", "queued", 1800)).toBe("advanced");
     expect(await state.isRevoked()).toBe(false);
     expect(await state.noteJob("7", "queued", 1800)).toBe("stale");
+    // A completed job advances the marker but revokes nothing: the run may
+    // still be going, and the review runs after the verify job.
     expect(await state.noteJob("7", "completed", 1800)).toBe("advanced");
-    expect(await state.isRevoked()).toBe(true);
+    expect(await state.isRevoked()).toBe(false);
     // A redelivery, or an older state arriving late, changes nothing.
     expect(await state.noteJob("7", "completed", 1800)).toBe("stale");
     expect(await state.noteJob("7", "in_progress", 1800)).toBe("stale");
@@ -279,46 +291,64 @@ describe("MuseTokens", () => {
   it("tracks jobs independently and ignores unknown actions", async () => {
     const { state } = recording();
     expect(await state.noteJob("8", "completed", 1800)).toBe("advanced");
-    expect(await state.isRevoked()).toBe(true);
+    expect(await state.isRevoked()).toBe(false);
     expect(await state.noteJob("9", "requested", 1800)).toBe("unknown");
   });
 
-  it("expires every entry with the token lifetime", async () => {
+  it("expires every entry with the given TTL", async () => {
     const { state, puts } = recording();
+    await state.claimEvent("abc", 30);
     await state.noteJob("7", "in_progress", 60);
-    await state.noteJob("7", "completed", 60);
-    expect(puts).toContainEqual({ key: "job:7", value: 2, opts: { expirationTtl: 60 } });
+    await state.completeRun(60);
+    expect(puts).toContainEqual({ key: "event:abc", value: true, opts: { expirationTtl: 30 } });
+    expect(puts).toContainEqual({ key: "job:7", value: 1, opts: { expirationTtl: 60 } });
     expect(puts).toContainEqual({ key: "revoked", value: true, opts: { expirationTtl: 60 } });
+    expect(puts).toContainEqual({ key: "done", value: true, opts: { expirationTtl: 60 } });
   });
 
-  it("serves notes and revocation over fetch", async () => {
+  it("completing the run revokes its tokens and deletes its job markers, once", async () => {
+    const { data, state } = recording();
+    expect(await state.completeRun(1800)).toBe("advanced");
+    expect(await state.isRevoked()).toBe(true);
+    expect(await state.completeRun(1800)).toBe("stale");
+    // A new delivery for the same job starts fresh: its markers are gone.
+    expect(await state.noteJob("7", "queued", 1800)).toBe("advanced");
+    expect(data.has("job:7")).toBe(true);
+  });
+
+  it("serves claims, notes, completions and revocation over fetch", async () => {
     const { state } = recording();
-    const noted = await state.fetch(
-      new Request("https://tokens.invalid/note", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jobId: "7", action: "completed", ttl: 1800 }),
-      }),
-    );
-    expect(await noted.json()).toEqual({ progress: "advanced" });
-    expect(await (await state.fetch(new Request("https://tokens.invalid/revoked"))).json()).toEqual({ revoked: true });
-    const bad = await state.fetch(
-      new Request("https://tokens.invalid/note", { method: "POST", body: "{}" }),
-    );
-    expect(bad.status).toBe(400);
-    expect((await state.fetch(new Request("https://tokens.invalid/elsewhere"))).status).toBe(404);
+    const post = (path: string, body: unknown) =>
+      state.fetch(
+        new Request(`https://patchset.invalid${path}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+      );
+    expect(await (await post("/claim", { key: "abc", windowSeconds: 30 })).json()).toEqual({ claimed: true });
+    expect(await (await post("/claim", { key: "abc", windowSeconds: 30 })).json()).toEqual({ claimed: false });
+    expect(await (await post("/note", { jobId: "7", action: "queued", ttl: 1800 })).json()).toEqual({ progress: "advanced" });
+    expect(await (await post("/complete", { ttl: 1800 })).json()).toEqual({ progress: "advanced" });
+    expect(await (await post("/complete", { ttl: 1800 })).json()).toEqual({ progress: "stale" });
+    expect(await (await state.fetch(new Request("https://patchset.invalid/revoked"))).json()).toEqual({ revoked: true });
+    expect((await post("/claim", { key: 7, windowSeconds: 30 })).status).toBe(400);
+    expect((await post("/note", { jobId: "7" })).status).toBe(400);
+    expect((await post("/complete", { ttl: "soon" })).status).toBe(400);
+    expect((await state.fetch(new Request("https://patchset.invalid/elsewhere"))).status).toBe(404);
   });
 
-  it("shares one run's state between clients, like isolates sharing the object", async () => {
+  it("shares one object's state between clients, like isolates sharing the object", async () => {
     const ns = memoryNamespace();
-    const webhookClient = ns.client();
-    const proxyClient = ns.client();
+    const webhookClient = ns.client;
+    const proxyClient = ns.client;
     expect(await proxyClient.isRevoked("123456")).toBe(false);
-    expect(await webhookClient.noteJob("123456", "7", "queued", 1800)).toBe("advanced");
-    expect(await webhookClient.noteJob("123456", "7", "completed", 1800)).toBe("advanced");
+    expect(await webhookClient.completeRun("123456", 1800)).toBe("advanced");
     // The proxy's isolate never saw the webhook: it still sees the revocation.
     expect(await proxyClient.isRevoked("123456")).toBe(true);
     expect(await proxyClient.isRevoked("other-run")).toBe(false);
+    expect(await proxyClient.claimEvent(REPO, 42, 3, "abc", 30)).toBe(true);
+    expect(await webhookClient.claimEvent(REPO, 42, 3, "abc", 30)).toBe(false);
   });
 });
 
@@ -416,8 +446,23 @@ describe("/v1/* proxy", () => {
 
 describe("POST /github-webhook", () => {
   const job = (action: string, id = 7, run_id = 123456) => ({ action, workflow_job: { id, run_id, status: action } });
+  const run = (action: string, id = 123456) => ({ action, workflow_run: { id, status: action } });
 
-  it("advances queued -> in_progress -> completed and revokes the run's tokens", async () => {
+  it("tracks jobs without revoking: a completed job is not the completed run", async () => {
+    const ticket = await mintTicket();
+    const { body } = await mint(await oidc(), ticket);
+    const { fetchImpl } = mockFetch();
+    const d = deps(fetchImpl);
+    const proxy = (token: string) =>
+      handle(new Request("https://relay.example/v1/x", { headers: { Authorization: `Bearer ${token}` } }), env, d);
+
+    // The verify job completes while the review is still running: the proxy
+    // must keep working until the whole run completes.
+    expect(((await postWebhook(job("completed", 1))).res.status)).toBe(200);
+    expect((await proxy(body.token)).status).toBe(200);
+  });
+
+  it("revokes the run's tokens and deletes its state when the run completes", async () => {
     const ticket = await mintTicket();
     const { body } = await mint(await oidc(), ticket);
     const { fetchImpl } = mockFetch();
@@ -428,24 +473,28 @@ describe("POST /github-webhook", () => {
     expect((await proxy(body.token)).status).toBe(200);
     expect(((await postWebhook(job("queued"))).res.status)).toBe(200);
     expect((await proxy(body.token)).status).toBe(200);
-    expect(((await postWebhook(job("in_progress"))).res.status)).toBe(200);
-    expect((await proxy(body.token)).status).toBe(200);
-    const done = await postWebhook(job("completed"));
+    const done = await postWebhook(run("completed"));
     expect(done.res.status).toBe(200);
     expect(done.logs.join("\n")).toContain("123456");
     expect((await proxy(body.token)).status).toBe(401);
+    // A redelivered completion revokes nothing new and stays quiet.
+    const again = await postWebhook(run("completed"));
+    expect(await again.res.text()).toMatch(/stale/);
+    expect(again.logs).toHaveLength(0);
   });
 
   it("stores entries with the configured token lifetime", async () => {
-    const noted: { runId: string; jobId: string; action: string; ttl: number }[] = [];
-    const client: MuseTokensClient = {
-      noteJob: async (runId, jobId, action, ttl) => {
-        noted.push({ runId, jobId, action, ttl });
+    const completed: { runId: string; ttl: number }[] = [];
+    const client: PatchSetClient = {
+      claimEvent: async () => true,
+      noteJob: async () => "advanced",
+      isRevoked: async () => false,
+      completeRun: async (runId, ttl) => {
+        completed.push({ runId, ttl });
         return "advanced";
       },
-      isRevoked: async () => false,
     };
-    const raw = JSON.stringify(job("completed"));
+    const raw = JSON.stringify(run("completed"));
     const headers = { "Content-Type": "application/json", "X-Hub-Signature-256": await hookSecret(raw) };
     const res = await handle(
       new Request("https://relay.example/github-webhook", { method: "POST", headers, body: raw }),
@@ -453,25 +502,23 @@ describe("POST /github-webhook", () => {
       deps(vi.fn(), client),
     );
     expect(res.status).toBe(200);
-    expect(noted).toEqual([{ runId: "123456", jobId: "7", action: "completed", ttl: 60 }]);
+    expect(completed).toEqual([{ runId: "123456", ttl: 60 }]);
   });
 
   it("is forward-only: repeats and stale deliveries change nothing", async () => {
     expect(await (await postWebhook(job("queued"))).res.text()).toMatch(/advanced/);
     expect(await (await postWebhook(job("queued"))).res.text()).toMatch(/stale/);
     expect(await (await postWebhook(job("in_progress"))).res.text()).toMatch(/advanced/);
-    const first = await postWebhook(job("completed"));
-    expect(await first.res.text()).toMatch(/advanced/);
-    expect(first.logs).toHaveLength(1);
-    // A redelivered completion, or an older state arriving late, revokes nothing new.
-    const again = await postWebhook(job("completed"));
-    expect(await again.res.text()).toMatch(/stale/);
-    expect(again.logs).toHaveLength(0);
+    expect(await (await postWebhook(job("completed"))).res.text()).toMatch(/advanced/);
+    // A redelivered completion, or an older state arriving late, changes nothing.
+    expect(await (await postWebhook(job("completed"))).res.text()).toMatch(/stale/);
     expect(await (await postWebhook(job("in_progress"))).res.text()).toMatch(/stale/);
   });
 
-  it("ignores unknown actions and pings without revoking", async () => {
+  it("ignores unknown actions, unfinished runs and pings", async () => {
     expect((await postWebhook(job("requested"))).res.status).toBe(200);
+    expect(await (await postWebhook(job("requested"))).res.text()).toMatch(/unknown/);
+    expect(await (await postWebhook(run("in_progress"))).res.text()).toMatch(/ignored/);
     const ping = await postWebhook({ zen: "hello", hook: { id: 1 } });
     expect(ping.res.status).toBe(200);
     expect(await ping.res.text()).toBe("pong\n");
@@ -479,7 +526,7 @@ describe("POST /github-webhook", () => {
   });
 
   it("verifies the HMAC signature", async () => {
-    const payload = job("completed");
+    const payload = run("completed");
     expect((await postWebhook(payload, env, false)).res.status).toBe(401);
     expect((await postWebhook(payload, env, "bad")).res.status).toBe(401);
     expect((await postWebhook("not json{{{", env, "bad")).res.status).toBe(401);

@@ -1,24 +1,17 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetTokenCache } from "../src/github";
-import { EventClaim } from "../src/claims";
 import { handle, type Env } from "../src/index";
 import { openTicket } from "../src/ticket";
-import type { MuseTokensClient } from "../src/muse";
+import { PatchSet, type PatchSetClient, type PatchSetStorage } from "../src/muse";
 import { testKey } from "./keys";
 
 let env: Env;
-
-const museTokens: MuseTokensClient = {
-  noteJob: async () => "advanced",
-  isRevoked: async () => false,
-};
 
 beforeAll(async () => {
   env = {
     WEBHOOK_SECRET: "s3cret",
     TICKET_SECRET: "ticket-key",
-    EVENT_CLAIM: undefined as unknown as DurableObjectNamespace,
-    MUSE_TOKENS: undefined as unknown as DurableObjectNamespace,
+    PATCHSET: undefined as unknown as DurableObjectNamespace,
     GITHUB_APP_ID: "12345",
     GITHUB_APP_PRIVATE_KEY: (await testKey()).pkcs1Pem,
     GERRIT_USER: "ci-bot",
@@ -83,8 +76,29 @@ function github(dispatchStatus = 204, uploader = "maintainer") {
   });
 }
 
+/** An in-memory stand-in for the PatchSet namespace: one claim per event key. */
+function memoryPatchSets() {
+  const seen = new Set<string>();
+  const keys: string[] = [];
+  const windows: number[] = [];
+  const client: PatchSetClient = {
+    claimEvent: async (project, change, patchset, key, windowSeconds) => {
+      const full = `${project}~${change}/${patchset}:${key}`;
+      keys.push(full);
+      windows.push(windowSeconds);
+      if (seen.has(full)) return false;
+      seen.add(full);
+      return true;
+    },
+    noteJob: async () => "advanced",
+    isRevoked: async () => false,
+    completeRun: async () => "advanced",
+  };
+  return { client, keys, windows };
+}
+
 /** Deps whose background work, sleeps and log lines the test can see. */
-function deps(fetchImpl: unknown, claim: (key: string) => Promise<boolean> = async () => true) {
+function deps(fetchImpl: unknown, patchSets: PatchSetClient = memoryPatchSets().client) {
   const pending: Promise<unknown>[] = [];
   const logs: string[] = [];
   const sleeps: number[] = [];
@@ -97,11 +111,10 @@ function deps(fetchImpl: unknown, claim: (key: string) => Promise<boolean> = asy
     sleep: async (ms: number) => {
       sleeps.push(ms);
     },
-    museTokens,
+    patchSets,
     log: (line: string) => {
       logs.push(line);
     },
-    claim,
     logs,
     sleeps,
     /** Waits for the work done after the response. */
@@ -246,17 +259,21 @@ describe("/gerrit/<secret>", () => {
   });
 });
 
-/** An in-memory stand-in for the Durable Object namespace: one claim per key. */
-function memoryClaimer() {
-  const seen = new Set<string>();
-  const keys: string[] = [];
-  const claim = async (key: string) => {
-    keys.push(key);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
+/** A PatchSet client whose claimEvent always says `say`, recording calls. */
+function scriptedClaim(say: boolean | Error) {
+  const calls: { project: string; change: number; patchset: number; key: string; windowSeconds: number }[] = [];
+  const { client } = memoryPatchSets();
+  return {
+    calls,
+    client: {
+      ...client,
+      claimEvent: async (project: string, change: number, patchset: number, key: string, windowSeconds: number) => {
+        calls.push({ project, change, patchset, key, windowSeconds });
+        if (say instanceof Error) throw say;
+        return say;
+      },
+    } satisfies PatchSetClient,
   };
-  return { claim, keys };
 }
 
 const recheck = (createdOn: number, text = "Patch Set 1:\n\nrecheck") => ({
@@ -271,8 +288,8 @@ const recheck = (createdOn: number, text = "Patch Set 1:\n\nrecheck") => ({
 describe("de-duplication", () => {
   it("dispatches once for five deliveries of one event", async () => {
     const fetchImpl = github();
-    const { claim } = memoryClaimer();
-    const d = deps(fetchImpl, claim);
+    const { client } = memoryPatchSets();
+    const d = deps(fetchImpl, client);
     for (let i = 0; i < 5; i++) {
       expect((await handle(post("/gerrit/s3cret", event), env, d)).status).toBe(202);
     }
@@ -283,8 +300,8 @@ describe("de-duplication", () => {
 
   it("runs two different rechecks on the same patch set, but not repeats of one", async () => {
     const fetchImpl = github();
-    const { claim } = memoryClaimer();
-    const d = deps(fetchImpl, claim);
+    const { client } = memoryPatchSets();
+    const d = deps(fetchImpl, client);
     for (const e of [recheck(1000), recheck(1000), recheck(1000), recheck(2000), recheck(2000)]) {
       await handle(post("/gerrit/s3cret", e), env, d);
     }
@@ -293,8 +310,8 @@ describe("de-duplication", () => {
   });
 
   it("keys differ by type, patch set and comment, and ignore the delivery order", async () => {
-    const { claim, keys } = memoryClaimer();
-    const d = deps(github(), claim);
+    const { client, keys } = memoryPatchSets();
+    const d = deps(github(), client);
     const ps2 = { ...event.patchSet, number: 2, ref: "refs/changes/07/7/2" };
     for (const e of [event, { ...event, patchSet: ps2 }, recheck(1000), recheck(1000, "recheck\n\nplease")]) {
       await handle(post("/gerrit/s3cret", e), env, d);
@@ -303,17 +320,37 @@ describe("de-duplication", () => {
     expect(new Set(keys).size).toBe(4);
   });
 
+  it("claims the patch set's object, for ten minutes by default", async () => {
+    const claimed = scriptedClaim(true);
+    const d = deps(github(), claimed.client);
+    await handle(post("/gerrit/s3cret", event), env, d);
+    await d.settled();
+    expect(claimed.calls).toHaveLength(1);
+    expect(claimed.calls[0]).toMatchObject({ project: "go-valkyrie/vali-scheme", change: 7, patchset: 1, windowSeconds: 600 });
+  });
+
+  it("honours DEDUPE_WINDOW_SECONDS, and ignores a bad value", async () => {
+    for (const [setting, window] of [["30", 30], ["soon", 600]] as const) {
+      const claimed = scriptedClaim(true);
+      const d = deps(github(), claimed.client);
+      await handle(post("/gerrit/s3cret", event), { ...env, DEDUPE_WINDOW_SECONDS: setting }, d);
+      await d.settled();
+      expect(claimed.calls[0].windowSeconds).toBe(window);
+    }
+  });
+
   it("claims after the cheap checks, so an ignored event claims nothing", async () => {
-    const claim = vi.fn(async () => true);
-    const d = deps(github(), claim);
+    const claimEvent = vi.fn(async () => true);
+    const { client } = memoryPatchSets();
+    const d = deps(github(), { ...client, claimEvent });
     await handle(post("/gerrit/s3cret", { ...event, type: "ref-updated" }), env, d);
     await d.settled();
-    expect(claim).not.toHaveBeenCalled();
+    expect(claimEvent).not.toHaveBeenCalled();
   });
 
   it("claims before asking Gerrit, so a duplicate makes no requests", async () => {
     const fetchImpl = github();
-    const d = deps(fetchImpl, async () => false);
+    const d = deps(fetchImpl, scriptedClaim(false).client);
     await handle(post("/gerrit/s3cret", event), env, d);
     await d.settled();
     expect(fetchImpl).not.toHaveBeenCalled();
@@ -321,9 +358,7 @@ describe("de-duplication", () => {
 
   it("dispatches anyway, and logs it, when the claim fails", async () => {
     const fetchImpl = github();
-    const d = deps(fetchImpl, async () => {
-      throw new Error("Durable Object unavailable");
-    });
+    const d = deps(fetchImpl, scriptedClaim(new Error("Durable Object unavailable")).client);
     await handle(post("/gerrit/s3cret", event), env, d);
     await d.settled();
     expect(calls(fetchImpl, "/dispatches")).toBe(1);
@@ -332,64 +367,40 @@ describe("de-duplication", () => {
   });
 });
 
-describe("EventClaim", () => {
-  function fakeState() {
+describe("PatchSet", () => {
+  function memoryState() {
     const data = new Map<string, unknown>();
-    let alarm: number | undefined;
-    return {
-      data,
-      alarmAt: () => alarm,
-      storage: {
-        get: async (k: string) => data.get(k),
-        put: async (k: string, v: unknown) => void data.set(k, v),
-        setAlarm: async (t: number) => void (alarm = t),
-        deleteAll: async () => {
-          data.clear();
-          alarm = undefined;
-        },
+    const puts: { key: string; value: unknown; opts?: { expirationTtl?: number } }[] = [];
+    const storage: PatchSetStorage = {
+      get: async (key: string) => data.get(key),
+      put: async (key: string, value: unknown, opts?: { expirationTtl?: number }) => {
+        data.set(key, value);
+        puts.push({ key, value, opts });
       },
+      delete: async (key: string) => data.delete(key),
+      list: async ({ prefix }: { prefix: string }) => new Map([...data].filter(([k]) => k.startsWith(prefix))),
     };
+    return { state: new PatchSet({ storage }), puts };
   }
 
-  it("grants the first claim and refuses the rest", async () => {
-    const claim = new EventClaim(fakeState(), {}, () => 0);
-    expect(await claim.claim()).toBe(true);
-    expect(await claim.claim()).toBe(false);
-    expect(await claim.claim()).toBe(false);
+  it("claims each delivery key once, expiring with the window", async () => {
+    const { state, puts } = memoryState();
+    expect(await state.claimEvent("abc", 30)).toBe(true);
+    expect(await state.claimEvent("abc", 30)).toBe(false);
+    expect(await state.claimEvent("abc", 600)).toBe(false);
+    expect(await state.claimEvent("def", 30)).toBe(true);
+    expect(puts).toContainEqual({ key: "event:abc", value: true, opts: { expirationTtl: 30 } });
   });
 
   it("serves claims over fetch", async () => {
-    const claim = new EventClaim(fakeState(), {}, () => 0);
-    expect(await (await claim.fetch(new Request("https://x/"))).json()).toEqual({ claimed: true });
-    expect(await (await claim.fetch(new Request("https://x/"))).json()).toEqual({ claimed: false });
-  });
-
-  it("sets an alarm ten minutes out, once, when first claimed", async () => {
-    const state = fakeState();
-    let now = 5_000;
-    const claim = new EventClaim(state, {}, () => now);
-    await claim.claim();
-    expect(state.alarmAt()).toBe(5_000 + 600_000);
-    now = 9_000;
-    await claim.claim();
-    expect(state.alarmAt()).toBe(5_000 + 600_000);
-  });
-
-  it("honours DEDUPE_WINDOW_SECONDS, and ignores a bad value", async () => {
-    const a = fakeState();
-    await new EventClaim(a, { DEDUPE_WINDOW_SECONDS: "30" }, () => 0).claim();
-    expect(a.alarmAt()).toBe(30_000);
-    const b = fakeState();
-    await new EventClaim(b, { DEDUPE_WINDOW_SECONDS: "soon" }, () => 0).claim();
-    expect(b.alarmAt()).toBe(600_000);
-  });
-
-  it("deletes everything when the alarm fires, and a later claim starts fresh", async () => {
-    const state = fakeState();
-    const claim = new EventClaim(state, {}, () => 0);
-    await claim.claim();
-    await claim.alarm();
-    expect(state.data.size).toBe(0);
-    expect(await claim.claim()).toBe(true);
+    const { state } = memoryState();
+    const claim = (body: unknown) =>
+      state.fetch(
+        new Request("https://x/claim", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+      );
+    expect(await (await claim({ key: "abc", windowSeconds: 30 })).json()).toEqual({ claimed: true });
+    expect(await (await claim({ key: "abc", windowSeconds: 30 })).json()).toEqual({ claimed: false });
+    expect((await claim({ key: 7, windowSeconds: 30 })).status).toBe(400);
+    expect((await state.fetch(new Request("https://x/elsewhere"))).status).toBe(404);
   });
 });
