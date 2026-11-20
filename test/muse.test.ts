@@ -110,7 +110,12 @@ function mockFetch(llmBody = "data: hello\n\ndata: world\n\n", gerritStatus: (ur
       gerritCalls.push({ url: u, init: init ?? {} });
       return Response.json({ ok: true }, { status: gerritStatus(u) });
     }
-    if (u.startsWith("https://api.meta.ai/v1/") || u.startsWith("https://llm.example/v1/")) {
+    if (
+      u.startsWith("https://api.meta.ai/v1/") ||
+      u.startsWith("https://llm.example/v1/") ||
+      u.startsWith("https://api.meta.ai/muse-code/") ||
+      u.startsWith("https://llm.example/muse-code/")
+    ) {
       llmCalls.push({ url: u, init: init ?? {} });
       return new Response(llmBody, { headers: { "Content-Type": "text/event-stream" } });
     }
@@ -455,6 +460,84 @@ describe("/v1/* proxy", () => {
     );
     expect(passthrough.status).toBe(400);
     expect(await passthrough.text()).toBe("bad request");
+  });
+});
+
+describe("/muse-code/* proxy", () => {
+  async function catalog(auth: string | undefined, path = "/muse-code/models?x=1", e: Env = env, d?: ReturnType<typeof deps>) {
+    const { fetchImpl, llmCalls } = mockFetch();
+    const dd = d ?? deps(fetchImpl);
+    const headers: Record<string, string> = {};
+    if (auth !== undefined) headers.Authorization = `Bearer ${auth}`;
+    const res = await handle(new Request(`https://relay.example${path}`, { headers }), e, dd);
+    return { res, llmCalls, logs: dd.logs };
+  }
+  const auth = (call: { init: RequestInit }) => (call.init.headers as Headers).get("Authorization");
+
+  it("forwards to the origin of the LLM base URL, swaps the key and keeps the query", async () => {
+    const { body } = await mint(await oidc(), await mintTicket());
+    const { res, llmCalls, logs } = await catalog(body.token);
+    expect(res.status).toBe(200);
+    expect(llmCalls).toHaveLength(1);
+    expect(llmCalls[0].url).toBe("https://api.meta.ai/muse-code/models?x=1");
+    expect(auth(llmCalls[0])).toBe(`Bearer ${LLM_KEY}`);
+    expect(logs.join("\n")).not.toContain(LLM_KEY);
+    expect(logs.join("\n")).not.toContain(body.token);
+  });
+
+  it("uses the origin of a custom LLM_BASE_URL", async () => {
+    const { body } = await mint(await oidc(), await mintTicket());
+    const { llmCalls } = await catalog(body.token, "/muse-code/models", { ...env, LLM_BASE_URL: "https://llm.example/some/v1" });
+    expect(llmCalls[0].url).toBe("https://llm.example/muse-code/models");
+  });
+
+  it("rejects missing, forged and OIDC tokens", async () => {
+    expect((await catalog(undefined)).res.status).toBe(401);
+    expect((await catalog("bogus.token.here")).res.status).toBe(401);
+    const oidcResult = await catalog(await oidc());
+    expect(oidcResult.res.status).toBe(401);
+    expect(oidcResult.llmCalls).toHaveLength(0);
+  });
+
+  it("refuses expired and revoked tokens", async () => {
+    const old = await signMuseToken(
+      { repo: REPO, change: 42, patchset: 3, revision: REVISION, ticket: "t", run_id: "1" },
+      env.TICKET_SECRET,
+      NOW - 4000,
+      60,
+    );
+    expect((await catalog(old)).res.status).toBe(401);
+    const { body } = await mint(await oidc(), await mintTicket());
+    const revoked = deps(mockFetch().fetchImpl, { ...tokens, isRevoked: async () => true });
+    const r = await catalog(body.token, "/muse-code/models", env, revoked);
+    expect(r.res.status).toBe(401);
+  });
+
+  it("answers 501 without an LLM key", async () => {
+    const { body } = await mint(await oidc(), await mintTicket());
+    expect((await catalog(body.token, "/muse-code/models", { ...env, LLM_API_KEY: undefined })).res.status).toBe(501);
+  });
+
+  it("can't be steered out of /muse-code/", async () => {
+    const { body } = await mint(await oidc(), await mintTicket());
+    for (const path of [
+      "/muse-code/..%2fv1/x",
+      "/muse-code/%2e%2e%2fv1/x",
+      "/muse-code/a%5c..%5c..%5cv1/x",
+      "/muse-code/%252e%252e/x%2f..",
+      "/muse-code/%zz",
+    ]) {
+      const { res, llmCalls } = await catalog(body.token, path);
+      expect(res.status, path).toBe(400);
+      expect(llmCalls, path).toHaveLength(0);
+    }
+    // Literal and %2e dot segments are folded by URL parsing before routing.
+    for (const path of ["/muse-code/../v1/x", "/muse-code/%2e%2e/v1/x", "/muse-code/a/../../etc"]) {
+      const { llmCalls } = await catalog(body.token, path);
+      for (const call of llmCalls) {
+        expect(new URL(call.url).pathname.startsWith("/muse-code/") || call.url.startsWith("https://api.meta.ai/v1/"), path).toBe(true);
+      }
+    }
   });
 });
 

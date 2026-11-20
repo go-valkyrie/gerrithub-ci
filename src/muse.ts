@@ -7,8 +7,9 @@
 //      expiry), checks the ticket, and checks the token may vote for the
 //      ticket's repository. It answers with an ephemeral JWT scoped to that
 //      repo, ticket, change and patch set, valid for ~30 minutes.
-//   2. /v1/*: a transparent proxy to the LLM's API. It accepts only the
-//      ephemeral token, swaps in the real LLM key, and streams the request
+//   2. /v1/* and /muse-code/*: a transparent proxy to the LLM's API (the
+//      latter is Muse Code's model catalog, served from the API's origin).
+//      It accepts only the ephemeral token, swaps in the real LLM key, and streams the request
 //      and response bodies through untouched (SSE included).
 //   3. POST /github-webhook: GitHub's workflow_job and workflow_run events,
 //      HMAC-signed. Jobs are tracked forward-only (queued -> in_progress ->
