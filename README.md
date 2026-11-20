@@ -59,7 +59,7 @@ To use it, set `LLM_API_KEY` (and `GITHUB_WEBHOOK_SECRET`, plus a webhook on the
 ```yaml
   review:
     needs: verify
-    if: always()
+    if: always() && github.event.client_payload.change_kind != 'TRIVIAL_REBASE' && github.event.client_payload.change_kind != 'NO_CHANGE'
     runs-on: ubuntu-latest
     permissions:
       id-token: write

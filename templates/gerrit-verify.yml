@@ -20,8 +20,7 @@ permissions:
   contents: read
 
 env:
-  GERRIT_URL: https://review.gerrithub.io
-  PROJECT: ${{ github.event.client_payload.project }}
+  REPO_URL: ${{ github.event.client_payload.repo_url }}
   REF: ${{ github.event.client_payload.ref }}
   REVISION: ${{ github.event.client_payload.revision }}
 
@@ -38,7 +37,7 @@ jobs:
         run: |
           case "$REF" in refs/changes/[0-9][0-9]/*/*) ;; *) echo "bad ref: $REF"; exit 1 ;; esac
           git init -q .
-          git fetch -q --depth=1 "$GERRIT_URL/$PROJECT" "$REF"
+          git fetch -q --depth=1 "$REPO_URL" "$REF"
           git checkout -q FETCH_HEAD
           test "$(git rev-parse HEAD)" = "$REVISION"
 

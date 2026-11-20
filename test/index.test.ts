@@ -134,7 +134,8 @@ describe("/gerrit/<secret>", () => {
     const body = JSON.parse(init.body as string);
     expect(body.event_type).toBe("gerrit-verify");
     expect(body.client_payload.ref).toBe("refs/changes/07/7/1");
-    expect(Object.keys(body.client_payload).length).toBeLessThanOrEqual(10);
+    expect(body.client_payload.repo_url).toBe("https://review.gerrithub.io/go-valkyrie/vali-scheme");
+    expect(Object.keys(body.client_payload).sort()).toEqual(["change", "patchset", "ref", "repo_url", "revision", "ticket"]);
     const ticket = await openTicket(body.client_payload.ticket, env.TICKET_SECRET, NOW);
     expect(ticket).toMatchObject({
       project: "go-valkyrie/vali-scheme",
@@ -215,13 +216,15 @@ describe("/gerrit/<secret>", () => {
     expect(d.logs.at(-1)).toMatch(/^failed change 7,1 .*installation on go-valkyrie\/vali-scheme returned 404/);
   });
 
-  it("carries Gerrit's change kind in the ticket, and still dispatches CI", async () => {
+  it("carries Gerrit's change kind in the ticket and payload, and still dispatches CI", async () => {
     const fetchImpl = github(204, "maintainer", "TRIVIAL_REBASE");
     const d = deps(fetchImpl);
     await handle(post("/gerrit/s3cret", event), env, d);
     await d.settled();
     expect(d.logs).toEqual(["dispatched go-valkyrie/vali-scheme change 7,1 (patchset-created)"]);
-    const ticket = await openTicket(JSON.parse(dispatchCall(fetchImpl)![1].body as string).client_payload.ticket, env.TICKET_SECRET, NOW);
+    const payload = JSON.parse(dispatchCall(fetchImpl)![1].body as string).client_payload;
+    expect(payload.change_kind).toBe("TRIVIAL_REBASE");
+    const ticket = await openTicket(payload.ticket, env.TICKET_SECRET, NOW);
     expect(ticket).toMatchObject({ change: 7, patchset: 1, kind: "TRIVIAL_REBASE" });
   });
 

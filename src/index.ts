@@ -167,20 +167,19 @@ async function dispatch(env: Env, repo: string, target: Target, kind: string | u
   return deps.fetch(`https://api.github.com/repos/${repo}/dispatches`, {
     method: "POST",
     headers: { ...apiHeaders(token), "Content-Type": "application/json" },
-    // client_payload may have at most 10 top-level properties.
+    // client_payload may have at most 10 top-level properties; this uses 7.
+    // The job fetches from the Gerrit URL directly (no mirror lag), and the
+    // change kind lets the review job skip trivial rebases before minting.
     body: JSON.stringify({
       event_type: env.EVENT_TYPE || "gerrit-verify",
       client_payload: {
-        project: target.project,
-        branch: target.branch,
-        change: target.change,
-        patchset: target.patchset,
+        repo_url: `${gerritUrl(env)}/${target.project}`,
         ref: target.ref,
         revision: target.revision,
-        url: target.url,
-        uploader: target.uploader,
-        trigger: target.trigger,
         ticket,
+        change: target.change,
+        patchset: target.patchset,
+        ...(kind ? { change_kind: kind } : {}),
       },
     }),
   });
