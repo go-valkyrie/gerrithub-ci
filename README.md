@@ -35,6 +35,50 @@ Someone who learned the webhook URL could only make the Worker re-check real eve
 
 In the workflow, the job that runs the change's code gets no secrets and can't request an OIDC token. Only the `vote` job has `id-token: write`.
 
+## Muse review (optional)
+
+A review job can ask an LLM to review the patch set without ever holding the LLM key. The Worker mints a short-lived token for the run, proxies the LLM calls, and posts the review to Gerrit:
+
+```text
+review job ── OIDC + ticket ──▶ POST /muse-token ── ephemeral token (30 min, this ticket only)
+review job ── ephemeral token ─▶ /v1/* ──▶ LLM API (Worker swaps in LLM_API_KEY, streams SSE back)
+review job ── OIDC + ticket ──▶ POST /review {review, codeReview} ──▶ Gerrit setReview
+GitHub ── workflow_job events ─▶ POST /github-webhook ── completed revokes the run's tokens
+```
+
+- **`POST /muse-token`:** like `/vote`, it checks the OIDC token (issuer, audience, expiry) and that the token's workflow and repository match the ticket. It answers `{token, expires_in, expires_at}`. The token is bound to the repo, ticket, change, patch set and run, and dies with its own expiry whatever else happens.
+- **`/v1/*`:** forwards any method, path and query to `LLM_BASE_URL` (default `https://api.meta.ai/v1`), replacing the caller's bearer token with `LLM_API_KEY`. Request and response bodies stream through untouched, so SSE works. It accepts only ephemeral tokens; a GitHub OIDC token is rejected. Without `LLM_API_KEY` it answers 501.
+- **`POST /github-webhook`:** GitHub `workflow_job` webhook events, checked against `GITHUB_WEBHOOK_SECRET` (`X-Hub-Signature-256`). Each job is tracked forward-only (`queued` → `in_progress` → `completed`); when a job completes, its run's tokens are revoked. Retried or out-of-order deliveries change nothing.
+- **`POST /review`:** like `/vote`, it checks the OIDC token and ticket, then posts `review` markdown to the ticket's revision with `setReview`. It votes `Code-Review +1` only when the body says `"codeReview": true`.
+
+The Worker never logs keys, tokens, prompts, reviews or diffs — the proxy never reads a body, and the webhook log names only the run and job.
+
+To use it, set `LLM_API_KEY` (and `GITHUB_WEBHOOK_SECRET`, plus a `workflow_job` webhook on the mirror repository pointing at `/github-webhook`), and give the review job `id-token: write`. It mints its token like the `vote` job does, then calls the LLM through `$WORKER/v1/...` and posts the result:
+
+```yaml
+  review:
+    needs: verify
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Review the patch set
+        env:
+          TICKET: ${{ github.event.client_payload.ticket }}
+          WORKER: ${{ vars.GERRITHUB_CI_URL }}
+        run: |
+          token=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=gerrithub-ci" | jq -r .value)
+          ephemeral=$(curl -fsS -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+            --data "$(jq -n --arg ticket "$TICKET" '{ticket: $ticket}')" "$WORKER/muse-token" | jq -r .token)
+          # ... call "$WORKER/v1/..." with "Authorization: Bearer $ephemeral",
+          # keep the review, then post it:
+          jq -n --arg ticket "$TICKET" --arg review "$REVIEW" '{ticket: $ticket, review: $review}' |
+          curl -fsS -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+            --data @- "$WORKER/review"
+```
+
 ## Set up
 
 1. **Create a GitHub App** to send the dispatches, under Settings → Developer settings → GitHub Apps.

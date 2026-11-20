@@ -25,6 +25,14 @@ compatibility_date = "2026-11-01"
 #   BRANCH          main                                  (...and the branch it must run from)
 #   DEDUPE_WINDOW_SECONDS  600   (how long an event is remembered, so repeat deliveries are dropped)
 #
+# Optional, for the Muse-review proxy (all unset, and /v1/* answers 501,
+# /github-webhook answers 404, while /vote and /review keep working):
+#   LLM_API_KEY            the key the proxy swaps in for /v1/* calls
+#   LLM_BASE_URL           https://api.meta.ai/v1 (the API /v1/* forwards to)
+#   MUSE_TOKEN_SECRET      signs the ephemeral review tokens (defaults to TICKET_SECRET)
+#   MUSE_TOKEN_TTL_SECONDS 1800 (ephemeral token lifetime, at most 3600)
+#   GITHUB_WEBHOOK_SECRET  verifies the workflow_job webhook's HMAC signature
+#
 # For local development, put them in .dev.vars (gitignored).
 
 # The Worker reports what it did with each webhook event in its logs; keep them.
