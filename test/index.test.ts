@@ -1,17 +1,24 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetTokenCache } from "../src/github";
-import { EventClaim } from "../src/claims";
+import { EventClaim } from "../src/muse";
 import { handle, type Env } from "../src/index";
 import { openTicket } from "../src/ticket";
 import { testKey } from "./keys";
 
 let env: Env;
 
+const museTokens = {
+  noteJob: async () => "advanced" as const,
+  isRevoked: async () => false,
+  completeRun: async () => "advanced" as const,
+};
+
 beforeAll(async () => {
   env = {
     WEBHOOK_SECRET: "s3cret",
     TICKET_SECRET: "ticket-key",
     EVENT_CLAIM: undefined as unknown as DurableObjectNamespace,
+    MUSE_TOKENS: undefined as unknown as DurableObjectNamespace,
     GITHUB_APP_ID: "12345",
     GITHUB_APP_PRIVATE_KEY: (await testKey()).pkcs1Pem,
     GERRIT_USER: "ci-bot",
@@ -45,13 +52,13 @@ function post(path: string, body: unknown): Request {
 }
 
 /** Change 7 as Gerrit reports it: patch set 1 uploaded by `uploader`. */
-function gerritChange(uploader = "maintainer") {
+function gerritChange(uploader = "maintainer", kind?: string) {
   return {
     project: "go-valkyrie/vali-scheme",
     branch: "main",
     _number: 7,
     revisions: {
-      "0123456789abcdef0123456789abcdef01234567": { _number: 1, ref: "refs/changes/07/7/1", uploader: { username: uploader } },
+      "0123456789abcdef0123456789abcdef01234567": { _number: 1, ref: "refs/changes/07/7/1", uploader: { username: uploader }, ...(kind ? { kind } : {}) },
     },
     messages: [{ _revision_number: 1, message: "Patch Set 1:\n\nrecheck", author: { username: "maintainer" } }],
   };
@@ -61,11 +68,11 @@ function gerritChange(uploader = "maintainer") {
  * GitHub's API as the app sees it, and Gerrit's for change 7; `dispatchStatus`
  * is what the dispatch returns.
  */
-function github(dispatchStatus = 204, uploader = "maintainer") {
+function github(dispatchStatus = 204, uploader = "maintainer", kind?: string) {
   return vi.fn(async (url: string | URL | Request, _init?: RequestInit) => {
     const u = String(url);
     if (u.startsWith("https://review.gerrithub.io/a/changes/go-valkyrie%2Fvali-scheme~7?")) {
-      return new Response(`)]}'\n${JSON.stringify(gerritChange(uploader))}`);
+      return new Response(`)]}'\n${JSON.stringify(gerritChange(uploader, kind))}`);
     }
     if (u.endsWith("/installation")) return Response.json({ id: 99 });
     if (u.endsWith("/app/installations/99/access_tokens")) {
@@ -94,6 +101,7 @@ function deps(fetchImpl: unknown, claim: (key: string) => Promise<boolean> = asy
       logs.push(line);
     },
     claim,
+    museTokens,
     logs,
     sleeps,
     /** Waits for the work done after the response. */
@@ -205,6 +213,26 @@ describe("/gerrit/<secret>", () => {
     await d.settled();
     expect(calls(fetchImpl, "/installation")).toBe(3);
     expect(d.logs.at(-1)).toMatch(/^failed change 7,1 .*installation on go-valkyrie\/vali-scheme returned 404/);
+  });
+
+  it("skips a trivial rebase or unchanged patch set Gerrit reports", async () => {
+    for (const kind of ["TRIVIAL_REBASE", "NO_CHANGE"]) {
+      const fetchImpl = github(204, "maintainer", kind);
+      const d = deps(fetchImpl);
+      const res = await handle(post("/gerrit/s3cret", event), env, d);
+      expect(res.status).toBe(202);
+      await d.settled();
+      expect(d.logs).toEqual([expect.stringMatching(new RegExp(`^ignored change 7,1 .* Gerrit calls it ${kind}; nothing new to verify`))]);
+      expect(dispatchCall(fetchImpl)).toBeUndefined();
+    }
+  });
+
+  it("runs a reworked patch set even when Gerrit names a kind", async () => {
+    const fetchImpl = github(204, "maintainer", "REWORK");
+    const d = deps(fetchImpl);
+    await handle(post("/gerrit/s3cret", event), env, d);
+    await d.settled();
+    expect(dispatchCall(fetchImpl)).toBeDefined();
   });
 
   it("ignores a forged event that claims a trusted uploader Gerrit doesn't confirm", async () => {
