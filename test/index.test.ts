@@ -3,15 +3,22 @@ import { resetTokenCache } from "../src/github";
 import { EventClaim } from "../src/claims";
 import { handle, type Env } from "../src/index";
 import { openTicket } from "../src/ticket";
+import type { MuseTokensClient } from "../src/muse";
 import { testKey } from "./keys";
 
 let env: Env;
+
+const museTokens: MuseTokensClient = {
+  noteJob: async () => "advanced",
+  isRevoked: async () => false,
+};
 
 beforeAll(async () => {
   env = {
     WEBHOOK_SECRET: "s3cret",
     TICKET_SECRET: "ticket-key",
     EVENT_CLAIM: undefined as unknown as DurableObjectNamespace,
+    MUSE_TOKENS: undefined as unknown as DurableObjectNamespace,
     GITHUB_APP_ID: "12345",
     GITHUB_APP_PRIVATE_KEY: (await testKey()).pkcs1Pem,
     GERRIT_USER: "ci-bot",
@@ -90,6 +97,7 @@ function deps(fetchImpl: unknown, claim: (key: string) => Promise<boolean> = asy
     sleep: async (ms: number) => {
       sleeps.push(ms);
     },
+    museTokens,
     log: (line: string) => {
       logs.push(line);
     },

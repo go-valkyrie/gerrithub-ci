@@ -38,22 +38,26 @@ import {
   DEFAULT_LLM_BASE_URL,
   MUSE_TOKEN_TTL_SECONDS,
   MuseTokenError,
-  noteJobEvent,
   proxyToLlm,
-  revokeRun,
   signMuseToken,
+  tokensFor,
   verifyMuseToken,
   verifyWebhookSignature,
+  type JobProgress,
+  type MuseTokensClient,
 } from "./muse";
 import { confirmChange, fetchChange } from "./verify";
 import { TokenError, verifyGithubToken, type GithubClaims } from "./oidc";
 import { openTicket, signTicket, type Ticket } from "./ticket";
 
 export { EventClaim } from "./claims";
+export { MuseTokens } from "./muse";
 
 export interface Env {
   /** Durable Object namespace that de-duplicates deliveries; see src/claims.ts. */
   EVENT_CLAIM: DurableObjectNamespace;
+  /** Durable Object namespace that tracks review-token state per run; see src/muse.ts. */
+  MUSE_TOKENS: DurableObjectNamespace;
   /** How long an event is remembered, in seconds; defaults to 600. */
   DEDUPE_WINDOW_SECONDS?: string;
   /** Secret path segment GerritHub posts to. */
@@ -105,11 +109,14 @@ export interface Deps {
   log: (line: string) => void;
   /** Claims an event key: true for the first delivery of an event, false for repeats. */
   claim: Claimer;
+  /** Per-run review-token state: job progress and revocation. */
+  museTokens: MuseTokensClient;
 }
 
 function depsFor(ctx: ExecutionContext, env: Env): Deps {
   return {
     claim: claimerFor(env.EVENT_CLAIM),
+    museTokens: tokensFor(env.MUSE_TOKENS),
     fetch: (...args) => fetch(...args),
     now: () => Math.floor(Date.now() / 1000),
     waitUntil: (work) => ctx.waitUntil(work),
@@ -464,10 +471,16 @@ async function handleProxy(request: Request, env: Env, deps: Deps): Promise<Resp
   if (!token) return text("missing bearer token", 401, { "WWW-Authenticate": "Bearer" });
   // Rejected before anything is forwarded: unknown, expired and revoked
   // tokens all land here, as does any non-ephemeral token.
+  let runId: string;
   try {
-    await verifyMuseToken(token, museSecret(env), deps.now());
+    runId = (await verifyMuseToken(token, museSecret(env), deps.now())).run_id;
   } catch (e) {
     if (e instanceof MuseTokenError) return text("bad review token", 401, { "WWW-Authenticate": "Bearer" });
+    return text("could not check the review token", 502);
+  }
+  try {
+    if (await deps.museTokens.isRevoked(runId)) return text("bad review token", 401, { "WWW-Authenticate": "Bearer" });
+  } catch {
     return text("could not check the review token", 502);
   }
   const url = new URL(request.url);
@@ -506,10 +519,19 @@ async function handleGithubWebhook(request: Request, env: Env, deps: Deps): Prom
   const jobId = body.workflow_job.id;
   const action = body.action ?? "";
   if (jobId === undefined) return text("ignored: no job", 200);
-  const progress = noteJobEvent(String(jobId), action);
-  if (progress === "advanced" && action === "completed" && body.workflow_job.run_id !== undefined) {
-    revokeRun(String(body.workflow_job.run_id), deps.now());
-    deps.log(`run ${body.workflow_job.run_id} completed; revoked its review tokens`);
+  const runId = body.workflow_job.run_id;
+  if (runId === undefined) return text("ignored: no run", 200);
+  // Forward-only per job, and a genuine completion revokes the run's tokens
+  // in the same write, atomically. Retried deliveries are answered 200 so
+  // GitHub stops retrying.
+  let progress: JobProgress;
+  try {
+    progress = await deps.museTokens.noteJob(String(runId), String(jobId), action, museTtl(env));
+  } catch (e) {
+    return text(`token store failed: ${(e as Error).message}`, 502);
+  }
+  if (progress === "advanced" && action === "completed") {
+    deps.log(`run ${runId} completed; revoked its review tokens`);
   }
   return text(`job ${jobId} ${action}: ${progress}`, 200);
 }

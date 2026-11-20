@@ -133,59 +133,104 @@ export async function verifyMuseToken(token: string, secret: string, now: number
   }
   if (typeof claims.exp !== "number" || now > claims.exp + SKEW) throw new MuseTokenError("expired");
   if (typeof claims.iat === "number" && now < claims.iat - SKEW) throw new MuseTokenError("issued in the future");
-  if (isRunRevoked(claims.run_id, now)) throw new MuseTokenError("revoked");
   return claims;
 }
 
-// --- revocation ---------------------------------------------------------------
-// In-memory: a run's tokens die with its job. Entries older than the longest
-// a token can live are pruned on access; the token's own expiry is the
-// backstop when this isolate never saw the completion event.
+// --- per-run token state ----------------------------------------------------------
+// A module-level Map would be per-isolate: a revocation written on one
+// isolate is invisible to the rest. So each run's state lives in a Durable
+// Object named after the run: every delivery of its jobs' events reaches the
+// same instance, and revoking is one storage write next to the job's marker.
+// Entries expire with the token lifetime; the token's own expiry is the
+// backstop when the completion event never arrives.
 
-const revokedRuns = new Map<string, number>();
-
-/** Forgets revocations and job states. For tests. */
-export function resetMuseState(): void {
-  revokedRuns.clear();
-  jobStates.clear();
+/** The parts of DurableObjectStorage that per-run token state uses. */
+export interface TokenStorage {
+  get(key: string): Promise<unknown>;
+  put(key: string, value: unknown, opts?: { expirationTtl?: number }): Promise<void>;
 }
 
-function pruneRevocations(now: number): void {
-  for (const [run, at] of revokedRuns) {
-    if (now - at > MUSE_TOKEN_TTL_SECONDS + SKEW) revokedRuns.delete(run);
-  }
-}
-
-/** Marks every token minted for `runId` as dead. */
-export function revokeRun(runId: string, now: number): void {
-  revokedRuns.set(runId, now);
-  pruneRevocations(now);
-}
-
-export function isRunRevoked(runId: string, now: number): boolean {
-  pruneRevocations(now);
-  return revokedRuns.has(runId);
-}
-
-// --- workflow_job webhook -----------------------------------------------------
+/** Progress of one workflow_job delivery. */
+export type JobProgress = "advanced" | "stale" | "unknown";
 
 const JOB_ORDER: Record<string, number> = { queued: 0, in_progress: 1, completed: 2 };
 
-const jobStates = new Map<string, number>();
-
 /**
- * Records a workflow_job event for `jobId`. Forward-only: an event at or
- * behind the latest seen state is a duplicate or a stale redelivery and
- * changes nothing. Returns "advanced" only for genuine progress, so callers
- * revoke tokens exactly once, when the job completes.
+ * One run's review-token state. Forward-only per job: an event at or behind
+ * the latest seen state is a duplicate or a stale redelivery and changes
+ * nothing. A genuine completion revokes the run's tokens in the same write.
+ *
+ * A plain class with a `fetch` method rather than an RPC `DurableObject`
+ * subclass, so tests can build it without the Workers runtime.
  */
-export function noteJobEvent(jobId: string, action: string): "advanced" | "stale" | "unknown" {
-  const rank = JOB_ORDER[action];
-  if (rank === undefined) return "unknown";
-  const prev = jobStates.get(jobId) ?? -1;
-  if (rank <= prev) return "stale";
-  jobStates.set(jobId, rank);
-  return "advanced";
+export class MuseTokens {
+  constructor(private readonly state: { storage: TokenStorage }) {}
+
+  /** Records a delivery of one of the run's jobs. */
+  async noteJob(jobId: string, action: string, ttlSeconds: number): Promise<JobProgress> {
+    const rank = JOB_ORDER[action];
+    if (rank === undefined) return "unknown";
+    const key = `job:${jobId}`;
+    const prev = await this.state.storage.get(key);
+    if (typeof prev === "number" && rank <= prev) return "stale";
+    await this.state.storage.put(key, rank, { expirationTtl: ttlSeconds });
+    if (action === "completed") {
+      await this.state.storage.put("revoked", true, { expirationTtl: ttlSeconds });
+    }
+    return "advanced";
+  }
+
+  /** Whether a completed job revoked the run's tokens. */
+  async isRevoked(): Promise<boolean> {
+    return (await this.state.storage.get("revoked")) !== undefined;
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (request.method === "POST" && url.pathname === "/note") {
+      let note: { jobId?: unknown; action?: unknown; ttl?: unknown };
+      try {
+        note = (await request.json()) as typeof note;
+      } catch {
+        return Response.json({ error: "body is not JSON" }, { status: 400 });
+      }
+      if (typeof note.jobId !== "string" || typeof note.action !== "string" || typeof note.ttl !== "number") {
+        return Response.json({ error: "bad note" }, { status: 400 });
+      }
+      return Response.json({ progress: await this.noteJob(note.jobId, note.action, note.ttl) });
+    }
+    if (request.method === "GET" && url.pathname === "/revoked") {
+      return Response.json({ revoked: await this.isRevoked() });
+    }
+    return Response.json({ error: "not found" }, { status: 404 });
+  }
+}
+
+/** Per-run token state, addressed by run. */
+export interface MuseTokensClient {
+  noteJob(runId: string, jobId: string, action: string, ttlSeconds: number): Promise<JobProgress>;
+  isRevoked(runId: string): Promise<boolean>;
+}
+
+/** A client that reaches the Durable Object named after the run. */
+export function tokensFor(namespace: DurableObjectNamespace): MuseTokensClient {
+  const stub = (runId: string) => namespace.get(namespace.idFromName(`muse-run:${runId}`));
+  return {
+    noteJob: async (runId, jobId, action, ttlSeconds) => {
+      const res = await stub(runId).fetch("https://tokens.invalid/note", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jobId, action, ttl: ttlSeconds }),
+      });
+      if (!res.ok) throw new Error(`token store returned ${res.status}`);
+      return ((await res.json()) as { progress: JobProgress }).progress;
+    },
+    isRevoked: async (runId) => {
+      const res = await stub(runId).fetch("https://tokens.invalid/revoked");
+      if (!res.ok) throw new Error(`token store returned ${res.status}`);
+      return ((await res.json()) as { revoked: boolean }).revoked === true;
+    },
+  };
 }
 
 function hexToBytes(hex: string): Uint8Array | undefined {

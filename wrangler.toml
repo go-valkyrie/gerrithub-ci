@@ -46,6 +46,17 @@ enabled = true
 name = "EVENT_CLAIM"
 class_name = "EventClaim"
 
+# Tracks each run's review-token state (see src/muse.ts). One Durable Object
+# per run, named after it, so every isolate sees the same revocation; entries
+# expire with the token lifetime. SQLite-backed, like the claims above.
+[[durable_objects.bindings]]
+name = "MUSE_TOKENS"
+class_name = "MuseTokens"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["EventClaim"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["MuseTokens"]

@@ -2,7 +2,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { toBase64Url, utf8 } from "../src/encoding";
 import { handle, type Env } from "../src/index";
 import { GITHUB_ISSUER, resetKeyCache } from "../src/oidc";
-import { resetMuseState, sha256Hex, signMuseToken, verifyMuseToken } from "../src/muse";
+import { MuseTokens, sha256Hex, signMuseToken, verifyMuseToken, type MuseTokensClient, type TokenStorage } from "../src/muse";
 import { signTicket, type Ticket } from "../src/ticket";
 
 const NOW = 1_800_000_000;
@@ -13,6 +13,7 @@ const HOOK_SECRET = "hook-secret";
 
 const env: Env = {
   EVENT_CLAIM: undefined as unknown as DurableObjectNamespace,
+  MUSE_TOKENS: undefined as unknown as DurableObjectNamespace,
   WEBHOOK_SECRET: "s3cret",
   TICKET_SECRET: "ticket-key",
   GITHUB_APP_ID: "12345",
@@ -34,9 +35,39 @@ beforeAll(async () => {
   jwk = (await crypto.subtle.exportKey("jwk", keys.publicKey)) as JsonWebKey;
 });
 
+/**
+ * A stand-in for the Durable Object namespace: one MuseTokens instance per
+ * run, shared by every client made from it — like isolates sharing the real
+ * objects. A fresh namespace per test keeps tests isolated from each other.
+ */
+function memoryNamespace() {
+  const objects = new Map<string, MuseTokens>();
+  const at = (runId: string) => {
+    let o = objects.get(runId);
+    if (!o) {
+      const data = new Map<string, unknown>();
+      o = new MuseTokens({
+        storage: {
+          get: async (key: string) => data.get(key),
+          put: async (key: string, value: unknown) => void data.set(key, value),
+        },
+      });
+      objects.set(runId, o);
+    }
+    return o;
+  };
+  const client = (): MuseTokensClient => ({
+    noteJob: (runId, jobId, action, ttl) => at(runId).noteJob(jobId, action, ttl),
+    isRevoked: (runId) => at(runId).isRevoked(),
+  });
+  return { client };
+}
+
+let tokens: MuseTokensClient;
+
 beforeEach(() => {
   resetKeyCache();
-  resetMuseState();
+  tokens = memoryNamespace().client();
 });
 
 const goodClaims = {
@@ -83,7 +114,7 @@ function mockFetch(llmBody = "data: hello\n\ndata: world\n\n") {
   return { fetchImpl, gerritCalls, llmCalls };
 }
 
-function deps(fetchImpl: unknown) {
+function deps(fetchImpl: unknown, museTokens?: MuseTokensClient) {
   const logs: string[] = [];
   return {
     fetch: fetchImpl as typeof fetch,
@@ -92,6 +123,7 @@ function deps(fetchImpl: unknown) {
     sleep: async () => {},
     log: (line: string) => void logs.push(line),
     claim: async () => true,
+    museTokens: museTokens ?? tokens,
     logs,
   };
 }
@@ -217,6 +249,79 @@ describe("ephemeral tokens", () => {
   });
 });
 
+describe("MuseTokens", () => {
+  function recording() {
+    const data = new Map<string, unknown>();
+    const puts: { key: string; value: unknown; opts?: { expirationTtl?: number } }[] = [];
+    const storage: TokenStorage = {
+      get: async (key: string) => data.get(key),
+      put: async (key: string, value: unknown, opts?: { expirationTtl?: number }) => {
+        data.set(key, value);
+        puts.push({ key, value, opts });
+      },
+    };
+    return { state: new MuseTokens({ storage }), puts };
+  }
+
+  it("is forward-only per job, and revokes the run on a genuine completion", async () => {
+    const { state } = recording();
+    expect(await state.isRevoked()).toBe(false);
+    expect(await state.noteJob("7", "queued", 1800)).toBe("advanced");
+    expect(await state.isRevoked()).toBe(false);
+    expect(await state.noteJob("7", "queued", 1800)).toBe("stale");
+    expect(await state.noteJob("7", "completed", 1800)).toBe("advanced");
+    expect(await state.isRevoked()).toBe(true);
+    // A redelivery, or an older state arriving late, changes nothing.
+    expect(await state.noteJob("7", "completed", 1800)).toBe("stale");
+    expect(await state.noteJob("7", "in_progress", 1800)).toBe("stale");
+  });
+
+  it("tracks jobs independently and ignores unknown actions", async () => {
+    const { state } = recording();
+    expect(await state.noteJob("8", "completed", 1800)).toBe("advanced");
+    expect(await state.isRevoked()).toBe(true);
+    expect(await state.noteJob("9", "requested", 1800)).toBe("unknown");
+  });
+
+  it("expires every entry with the token lifetime", async () => {
+    const { state, puts } = recording();
+    await state.noteJob("7", "in_progress", 60);
+    await state.noteJob("7", "completed", 60);
+    expect(puts).toContainEqual({ key: "job:7", value: 2, opts: { expirationTtl: 60 } });
+    expect(puts).toContainEqual({ key: "revoked", value: true, opts: { expirationTtl: 60 } });
+  });
+
+  it("serves notes and revocation over fetch", async () => {
+    const { state } = recording();
+    const noted = await state.fetch(
+      new Request("https://tokens.invalid/note", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jobId: "7", action: "completed", ttl: 1800 }),
+      }),
+    );
+    expect(await noted.json()).toEqual({ progress: "advanced" });
+    expect(await (await state.fetch(new Request("https://tokens.invalid/revoked"))).json()).toEqual({ revoked: true });
+    const bad = await state.fetch(
+      new Request("https://tokens.invalid/note", { method: "POST", body: "{}" }),
+    );
+    expect(bad.status).toBe(400);
+    expect((await state.fetch(new Request("https://tokens.invalid/elsewhere"))).status).toBe(404);
+  });
+
+  it("shares one run's state between clients, like isolates sharing the object", async () => {
+    const ns = memoryNamespace();
+    const webhookClient = ns.client();
+    const proxyClient = ns.client();
+    expect(await proxyClient.isRevoked("123456")).toBe(false);
+    expect(await webhookClient.noteJob("123456", "7", "queued", 1800)).toBe("advanced");
+    expect(await webhookClient.noteJob("123456", "7", "completed", 1800)).toBe("advanced");
+    // The proxy's isolate never saw the webhook: it still sees the revocation.
+    expect(await proxyClient.isRevoked("123456")).toBe(true);
+    expect(await proxyClient.isRevoked("other-run")).toBe(false);
+  });
+});
+
 describe("/v1/* proxy", () => {
   async function proxied(auth: string | undefined, e: Env = env, llmBody?: string) {
     const { fetchImpl, llmCalls } = mockFetch(llmBody);
@@ -329,6 +434,26 @@ describe("POST /github-webhook", () => {
     expect(done.res.status).toBe(200);
     expect(done.logs.join("\n")).toContain("123456");
     expect((await proxy(body.token)).status).toBe(401);
+  });
+
+  it("stores entries with the configured token lifetime", async () => {
+    const noted: { runId: string; jobId: string; action: string; ttl: number }[] = [];
+    const client: MuseTokensClient = {
+      noteJob: async (runId, jobId, action, ttl) => {
+        noted.push({ runId, jobId, action, ttl });
+        return "advanced";
+      },
+      isRevoked: async () => false,
+    };
+    const raw = JSON.stringify(job("completed"));
+    const headers = { "Content-Type": "application/json", "X-Hub-Signature-256": await hookSecret(raw) };
+    const res = await handle(
+      new Request("https://relay.example/github-webhook", { method: "POST", headers, body: raw }),
+      { ...env, MUSE_TOKEN_TTL_SECONDS: "60" },
+      deps(vi.fn(), client),
+    );
+    expect(res.status).toBe(200);
+    expect(noted).toEqual([{ runId: "123456", jobId: "7", action: "completed", ttl: 60 }]);
   });
 
   it("is forward-only: repeats and stale deliveries change nothing", async () => {
