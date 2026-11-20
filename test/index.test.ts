@@ -215,24 +215,24 @@ describe("/gerrit/<secret>", () => {
     expect(d.logs.at(-1)).toMatch(/^failed change 7,1 .*installation on go-valkyrie\/vali-scheme returned 404/);
   });
 
-  it("skips a trivial rebase or unchanged patch set Gerrit reports", async () => {
-    for (const kind of ["TRIVIAL_REBASE", "NO_CHANGE"]) {
-      const fetchImpl = github(204, "maintainer", kind);
-      const d = deps(fetchImpl);
-      const res = await handle(post("/gerrit/s3cret", event), env, d);
-      expect(res.status).toBe(202);
-      await d.settled();
-      expect(d.logs).toEqual([expect.stringMatching(new RegExp(`^ignored change 7,1 .* Gerrit calls it ${kind}; nothing new to verify`))]);
-      expect(dispatchCall(fetchImpl)).toBeUndefined();
-    }
-  });
-
-  it("runs a reworked patch set even when Gerrit names a kind", async () => {
-    const fetchImpl = github(204, "maintainer", "REWORK");
+  it("carries Gerrit's change kind in the ticket, and still dispatches CI", async () => {
+    const fetchImpl = github(204, "maintainer", "TRIVIAL_REBASE");
     const d = deps(fetchImpl);
     await handle(post("/gerrit/s3cret", event), env, d);
     await d.settled();
-    expect(dispatchCall(fetchImpl)).toBeDefined();
+    expect(d.logs).toEqual(["dispatched go-valkyrie/vali-scheme change 7,1 (patchset-created)"]);
+    const ticket = await openTicket(JSON.parse(dispatchCall(fetchImpl)![1].body as string).client_payload.ticket, env.TICKET_SECRET, NOW);
+    expect(ticket).toMatchObject({ change: 7, patchset: 1, kind: "TRIVIAL_REBASE" });
+  });
+
+  it("leaves the ticket kindless when Gerrit doesn't name one", async () => {
+    const fetchImpl = github();
+    const d = deps(fetchImpl);
+    await handle(post("/gerrit/s3cret", event), env, d);
+    await d.settled();
+    const ticket = await openTicket(JSON.parse(dispatchCall(fetchImpl)![1].body as string).client_payload.ticket, env.TICKET_SECRET, NOW);
+    expect(ticket).toMatchObject({ change: 7, patchset: 1 });
+    expect(ticket!.kind).toBeUndefined();
   });
 
   it("ignores a forged event that claims a trusted uploader Gerrit doesn't confirm", async () => {

@@ -50,7 +50,7 @@ import {
   type JobProgress,
   type MuseTokensClient,
 } from "./muse";
-import { confirmChange, fetchChange, trivialKind } from "./verify";
+import { NO_REVIEW_KINDS, confirmChange, fetchChange } from "./verify";
 import { TokenError, verifyGithubToken, type GithubClaims } from "./oidc";
 import { openTicket, signTicket, type Ticket } from "./ticket";
 
@@ -145,7 +145,7 @@ function gerritUrl(env: Env): string {
 
 // --- /gerrit/<secret> -------------------------------------------------------
 
-async function dispatch(env: Env, repo: string, target: Target, deps: Deps): Promise<Response> {
+async function dispatch(env: Env, repo: string, target: Target, kind: string | undefined, deps: Deps): Promise<Response> {
   const ticket = await signTicket(
     {
       project: target.project,
@@ -153,6 +153,7 @@ async function dispatch(env: Env, repo: string, target: Target, deps: Deps): Pro
       patchset: target.patchset,
       revision: target.revision,
       repo,
+      ...(kind ? { kind } : {}),
       iat: deps.now(),
     },
     env.TICKET_SECRET,
@@ -264,15 +265,13 @@ async function confirmAndDispatch(env: Env, policy: Policy, event: GerritEvent, 
       deps.log(`ignored ${label}: not confirmed by Gerrit: ${confirmation.reason}`);
       return;
     }
-    const kind = trivialKind(change, hint);
-    if (kind) {
-      deps.log(`ignored ${label}: Gerrit calls it ${kind}; nothing new to verify`);
-      return;
-    }
     const target = { ...hint, uploader: confirmation.uploader };
     const repo = policy.projects[target.project];
+    // Gerrit's change kind travels in the ticket, so the review job can tell
+    // a trivial rebase from new code without Gerrit credentials of its own.
+    const kind = change.revisions?.[target.revision]?.kind;
     await withRetries("dispatching to GitHub", deps, async () => {
-      const response = await dispatch(env, repo, target, deps);
+      const response = await dispatch(env, repo, target, kind, deps);
       if (!response.ok) {
         const detail = await response.text().catch(() => "");
         const message = `GitHub returned ${response.status}: ${detail}`;
@@ -456,6 +455,12 @@ async function handleMuseToken(request: Request, env: Env, deps: Deps): Promise<
   const auth = await authenticateRunner(request, env, deps);
   if (auth instanceof Response) return auth;
   const { claims, ticket, ticketText } = auth;
+
+  // Identical code gets no review: minting is the expensive gate (it unlocks
+  // LLM calls), while posting a comment via /review stays allowed.
+  if (ticket.kind && NO_REVIEW_KINDS.has(ticket.kind)) {
+    return text(`nothing new to review (${ticket.kind})`, 409);
+  }
 
   const ttl = museTtl(env);
   const now = deps.now();
