@@ -18,9 +18,10 @@
 //   The review job exchanges its GitHub OIDC token plus the ticket for a
 //   short-lived token scoped to the repo, ticket, change and patch set.
 //
-// /v1/*
-//   Proxies to the LLM's API with the Worker's key. Accepts only the
-//   short-lived token above, and streams the answer through.
+// /v1/* and /muse-code/*
+//   Proxy to the LLM's API with the Worker's key. /v1/* goes to LLM_BASE_URL;
+//   /muse-code/* (Muse Code's model catalog) goes to the same host's root.
+//   Both accept only the short-lived token above, and stream the answer through.
 //
 // POST /github-webhook
 //   GitHub's workflow_job and workflow_run events, HMAC-signed. Jobs are
@@ -89,7 +90,7 @@ export interface Env {
   BRANCH?: string;
   /** Key for the LLM API behind /v1/*. Unset, and the proxy answers 501. */
   LLM_API_KEY?: string;
-  /** Base URL the proxy forwards /v1/* to; defaults to https://api.meta.ai/v1. */
+  /** Base URL the proxy forwards /v1/* to (/muse-code/* goes to its origin); defaults to https://api.meta.ai/v1. */
   LLM_BASE_URL?: string;
   /** Signs ephemeral review tokens; defaults to TICKET_SECRET. */
   MUSE_TOKEN_SECRET?: string;
@@ -623,9 +624,37 @@ async function handleMuseToken(request: Request, env: Env, deps: Deps): Promise<
   return Response.json({ token, expires_in: ttl, expires_at: new Date((now + ttl) * 1000).toISOString() });
 }
 
-// --- /v1/* proxy ----------------------------------------------------------------
+// --- /v1/* and /muse-code/* proxy -----------------------------------------------
 // Accepts only ephemeral tokens from /muse-token: a GitHub OIDC token fails
 // the HMAC check. The LLM key travels only between the Worker and the LLM.
+// /v1/* forwards to LLM_BASE_URL; /muse-code/* forwards to that URL's origin
+// plus the same path, since Muse Code fetches its catalog from the host root.
+
+/** Where a proxied path goes: the base URL to append `suffix` to, or undefined to refuse it. */
+function upstreamFor(pathname: string, llmBase: string): { base: string; suffix: string } | undefined {
+  if (pathname === "/v1" || pathname.startsWith("/v1/")) {
+    return { base: llmBase, suffix: pathname.slice("/v1".length) || "/" };
+  }
+  // The URL parser already folds literal and %2e dot segments; what is left
+  // is an encoded slash or backslash that the upstream might decode into one.
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return undefined;
+  }
+  if (decoded.includes("\\") || decoded.split("/").some((seg) => seg === "." || seg === "..")) return undefined;
+  if (/%2f|%5c/i.test(pathname)) return undefined;
+  let origin: string;
+  try {
+    origin = new URL(llmBase).origin;
+  } catch {
+    return undefined;
+  }
+  const check = new URL(`${origin}${pathname}`);
+  if (check.origin !== origin || !(check.pathname === "/muse-code" || check.pathname.startsWith("/muse-code/"))) return undefined;
+  return { base: origin, suffix: pathname };
+}
 
 async function handleProxy(request: Request, env: Env, deps: Deps): Promise<Response> {
   if (!env.LLM_API_KEY) return text("review proxy is not configured", 501);
@@ -647,9 +676,10 @@ async function handleProxy(request: Request, env: Env, deps: Deps): Promise<Resp
     return text("could not check the review token", 502);
   }
   const url = new URL(request.url);
-  const suffix = url.pathname.slice("/v1".length) || "/";
+  const target = upstreamFor(url.pathname, env.LLM_BASE_URL || DEFAULT_LLM_BASE_URL);
+  if (!target) return text("bad path", 400);
   try {
-    return await proxyToLlm(request, suffix, url.search, env.LLM_API_KEY, env.LLM_BASE_URL || DEFAULT_LLM_BASE_URL, deps.fetch);
+    return await proxyToLlm(request, target.suffix, url.search, env.LLM_API_KEY, target.base, deps.fetch);
   } catch (e) {
     return text(`review backend failed: ${(e as Error).message}`, 502);
   }
@@ -719,7 +749,7 @@ export async function handle(request: Request, env: Env, deps: Deps): Promise<Re
   if (path === "/review") return handleReview(request, env, deps);
   if (path === "/muse-token") return handleMuseToken(request, env, deps);
   if (path === "/github-webhook") return handleGithubWebhook(request, env, deps);
-  if (path === "/v1" || path.startsWith("/v1/")) return handleProxy(request, env, deps);
+  if (path === "/v1" || path.startsWith("/v1/") || path === "/muse-code" || path.startsWith("/muse-code/")) return handleProxy(request, env, deps);
   const gerrit = /^\/gerrit\/([^/]+)$/.exec(path);
   if (gerrit && secretMatches(decodeURIComponent(gerrit[1]), env.WEBHOOK_SECRET || "")) {
     return handleGerrit(request, env, deps);
