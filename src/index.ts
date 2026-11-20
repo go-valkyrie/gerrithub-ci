@@ -13,20 +13,54 @@
 //   token came from the expected workflow on the expected repository and
 //   branch, checks the ticket, and votes Verified with its own Gerrit
 //   credentials.
+//
+// POST /muse-token
+//   The review job exchanges its GitHub OIDC token plus the ticket for a
+//   short-lived token scoped to the repo, ticket, change and patch set.
+//
+// /v1/*
+//   Proxies to the LLM's API with the Worker's key. Accepts only the
+//   short-lived token above, and streams the answer through.
+//
+// POST /github-webhook
+//   GitHub's workflow_job and workflow_run events, HMAC-signed. Jobs are
+//   tracked forward-only; when the run completes, its tokens are revoked
+//   and its state deleted.
+//
+// POST /review
+//   Like /vote, but posts review markdown to Gerrit, adding Code-Review +1
+//   only when asked.
 
-import { claimerFor, eventKey, type Claimer } from "./claims";
 import { sameBytes, utf8 } from "./encoding";
 import { decide, type GerritEvent, type Policy, type Target } from "./gerrit";
 import { apiHeaders, installationToken } from "./github";
-import { confirmChange, fetchChange } from "./verify";
+import {
+  DEFAULT_LLM_BASE_URL,
+  DEFAULT_WINDOW_SECONDS,
+  MUSE_TOKEN_TTL_SECONDS,
+  MuseTokenError,
+  claimerFor,
+  eventKey,
+  proxyToLlm,
+  signMuseToken,
+  tokensFor,
+  verifyMuseToken,
+  verifyWebhookSignature,
+  type Claimer,
+  type JobProgress,
+  type MuseTokensClient,
+} from "./muse";
+import { confirmChange, fetchChange, trivialKind } from "./verify";
 import { TokenError, verifyGithubToken, type GithubClaims } from "./oidc";
-import { openTicket, signTicket } from "./ticket";
+import { openTicket, signTicket, type Ticket } from "./ticket";
 
-export { EventClaim } from "./claims";
+export { EventClaim, MuseTokens } from "./muse";
 
 export interface Env {
-  /** Durable Object namespace that de-duplicates deliveries; see src/claims.ts. */
+  /** Durable Object namespace that de-duplicates deliveries; see src/muse.ts. */
   EVENT_CLAIM: DurableObjectNamespace;
+  /** Durable Object namespace holding each run's token state; see src/muse.ts. */
+  MUSE_TOKENS: DurableObjectNamespace;
   /** How long an event is remembered, in seconds; defaults to 600. */
   DEDUPE_WINDOW_SECONDS?: string;
   /** Secret path segment GerritHub posts to. */
@@ -53,6 +87,16 @@ export interface Env {
   WORKFLOW?: string;
   /** Branch the voting workflow must run from; defaults to "main". */
   BRANCH?: string;
+  /** Key for the LLM API behind /v1/*. Unset, and the proxy answers 501. */
+  LLM_API_KEY?: string;
+  /** Base URL the proxy forwards /v1/* to; defaults to https://api.meta.ai/v1. */
+  LLM_BASE_URL?: string;
+  /** Signs ephemeral review tokens; defaults to TICKET_SECRET. */
+  MUSE_TOKEN_SECRET?: string;
+  /** Ephemeral token lifetime in seconds; defaults to 1800. Clamped to one hour. */
+  MUSE_TOKEN_TTL_SECONDS?: string;
+  /** Signs GitHub's workflow_job webhook (X-Hub-Signature-256). Unset, and it answers 404. */
+  GITHUB_WEBHOOK_SECRET?: string;
 }
 
 type Fetch = typeof fetch;
@@ -68,11 +112,14 @@ export interface Deps {
   log: (line: string) => void;
   /** Claims an event key: true for the first delivery of an event, false for repeats. */
   claim: Claimer;
+  /** Per-run token state: job progress, revocation and deletion. */
+  museTokens: MuseTokensClient;
 }
 
 function depsFor(ctx: ExecutionContext, env: Env): Deps {
   return {
     claim: claimerFor(env.EVENT_CLAIM),
+    museTokens: tokensFor(env.MUSE_TOKENS),
     fetch: (...args) => fetch(...args),
     now: () => Math.floor(Date.now() / 1000),
     waitUntil: (work) => ctx.waitUntil(work),
@@ -217,6 +264,11 @@ async function confirmAndDispatch(env: Env, policy: Policy, event: GerritEvent, 
       deps.log(`ignored ${label}: not confirmed by Gerrit: ${confirmation.reason}`);
       return;
     }
+    const kind = trivialKind(change, hint);
+    if (kind) {
+      deps.log(`ignored ${label}: Gerrit calls it ${kind}; nothing new to verify`);
+      return;
+    }
     const target = { ...hint, uploader: confirmation.uploader };
     const repo = policy.projects[target.project];
     await withRetries("dispatching to GitHub", deps, async () => {
@@ -235,15 +287,21 @@ async function confirmAndDispatch(env: Env, policy: Policy, event: GerritEvent, 
   }
 }
 
-// --- /vote --------------------------------------------------------------------
+// --- runners: /vote, /review, /muse-token ---------------------------------------
+// Every runner endpoint trusts the same thing: a GitHub OIDC token from the
+// expected workflow, run and branch, plus the ticket the dispatch carried.
+// The body is read once here and handed to each handler with the claims.
 
-interface VoteBody {
-  ticket?: string;
-  /** The verify job's result: needs.verify.result in the workflow. */
-  result?: string;
+interface Runner {
+  claims: GithubClaims;
+  ticket: Ticket;
+  /** The ticket string the caller sent, for binding minted tokens to it. */
+  ticketText: string;
+  /** The request's JSON body. */
+  body: Record<string, unknown>;
 }
 
-/** Why the token's workflow may not vote, or undefined if it may. */
+/** Why the token's workflow may not act for `repo`, or undefined if it may. */
 function refuseWorkflow(claims: GithubClaims, repo: string, env: Env): string | undefined {
   const workflow = env.WORKFLOW || ".github/workflows/gerrit-verify.yml";
   const branch = `refs/heads/${env.BRANCH || "main"}`;
@@ -254,9 +312,7 @@ function refuseWorkflow(claims: GithubClaims, repo: string, env: Env): string | 
   return undefined;
 }
 
-async function handleVote(request: Request, env: Env, deps: Deps): Promise<Response> {
-  if (request.method !== "POST") return text("method not allowed", 405, { Allow: "POST" });
-
+async function authenticateRunner(request: Request, env: Env, deps: Deps): Promise<Runner | Response> {
   const auth = request.headers.get("Authorization") ?? "";
   const bearer = /^Bearer\s+(\S+)$/i.exec(auth);
   if (!bearer) return text("missing bearer token", 401, { "WWW-Authenticate": "Bearer" });
@@ -281,10 +337,51 @@ async function handleVote(request: Request, env: Env, deps: Deps): Promise<Respo
 
   const refusal = refuseWorkflow(claims, ticket.repo, env);
   if (refusal) return text(`refused: ${refusal}`, 403);
+  return { claims, ticket, ticketText: body.ticket, body: body as Record<string, unknown> };
+}
+
+function setReviewUrl(env: Env, ticket: Ticket): string {
+  const changeId = `${encodeURIComponent(ticket.project)}~${ticket.change}`;
+  return `${gerritUrl(env)}/a/changes/${changeId}/revisions/${ticket.revision}/review`;
+}
+
+/** Posts `message` with `labels` to the ticket's revision. Returns a response on failure. */
+async function postSetReview(
+  env: Env,
+  deps: Deps,
+  ticket: Ticket,
+  message: string,
+  labels: Record<string, number>,
+): Promise<Response | undefined> {
+  const credentials = btoa(`${env.GERRIT_USER}:${env.GERRIT_HTTP_PASSWORD}`);
+  const res = await deps.fetch(setReviewUrl(env, ticket), {
+    method: "POST",
+    headers: { Authorization: `Basic ${credentials}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ message, labels, tag: "autogenerated:gerrithub-ci" }),
+  });
+  if (!res.ok) return text("Gerrit refused the review", 502);
+  return undefined;
+}
+
+// --- /vote --------------------------------------------------------------------
+
+interface VoteBody {
+  ticket?: string;
+  /** The verify job's result: needs.verify.result in the workflow. */
+  result?: string;
+}
+
+async function handleVote(request: Request, env: Env, deps: Deps): Promise<Response> {
+  if (request.method !== "POST") return text("method not allowed", 405, { Allow: "POST" });
+
+  const auth = await authenticateRunner(request, env, deps);
+  if (auth instanceof Response) return auth;
+  const { claims, ticket } = auth;
+  const result = auth.body.result as VoteBody["result"];
 
   let vote: number;
   let word: string;
-  switch (body.result) {
+  switch (result) {
     case "success":
       vote = 1;
       word = "passed";
@@ -296,28 +393,163 @@ async function handleVote(request: Request, env: Env, deps: Deps): Promise<Respo
     case "cancelled":
     case "skipped":
       // Superseded by a newer patch set, or never ran: leave the vote alone.
-      return text(`not voting on a ${body.result} run`, 200);
+      return text(`not voting on a ${result} run`, 200);
     default:
-      return text(`unknown result ${String(body.result)}`, 400);
+      return text(`unknown result ${String(result)}`, 400);
   }
 
   const runUrl = `https://github.com/${claims.repository}/actions/runs/${claims.run_id}`;
-  const changeId = `${encodeURIComponent(ticket.project)}~${ticket.change}`;
-  const credentials = btoa(`${env.GERRIT_USER}:${env.GERRIT_HTTP_PASSWORD}`);
-  const res = await deps.fetch(`${gerritUrl(env)}/a/changes/${changeId}/revisions/${ticket.revision}/review`, {
-    method: "POST",
-    headers: { Authorization: `Basic ${credentials}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      message: `Build ${word}: ${runUrl}`,
-      labels: { Verified: vote },
-      tag: "autogenerated:gerrithub-ci",
-    }),
-  });
-  if (!res.ok) {
-    const detail = await res.text().catch(() => "");
-    return text(`Gerrit returned ${res.status}: ${detail}`, 502);
-  }
+  const failed = await postSetReview(env, deps, ticket, `Build ${word}: ${runUrl}`, { Verified: vote });
+  if (failed) return failed;
   return text(`voted Verified ${vote > 0 ? "+1" : "-1"} on change ${ticket.change},${ticket.patchset}`, 200);
+}
+
+// --- /review ------------------------------------------------------------------
+
+interface ReviewBody {
+  ticket?: string;
+  /** The review markdown to post on the patch set. */
+  review?: string;
+  /** When true, the review also votes Code-Review +1. Never voted otherwise. */
+  codeReview?: boolean;
+}
+
+/** Largest review the Worker forwards to Gerrit. */
+const MAX_REVIEW_CHARS = 64 * 1024;
+
+async function handleReview(request: Request, env: Env, deps: Deps): Promise<Response> {
+  if (request.method !== "POST") return text("method not allowed", 405, { Allow: "POST" });
+
+  const auth = await authenticateRunner(request, env, deps);
+  if (auth instanceof Response) return auth;
+  const review = auth.body.review as ReviewBody["review"];
+  const codeReview = auth.body.codeReview as ReviewBody["codeReview"];
+  if (typeof review !== "string" || review.trim() === "") return text("missing review", 400);
+  if (review.length > MAX_REVIEW_CHARS) return text("review is too long", 400);
+
+  const { ticket } = auth;
+  const labels: Record<string, number> = codeReview === true ? { "Code-Review": 1 } : {};
+  const failed = await postSetReview(env, deps, ticket, review, labels);
+  if (failed) return failed;
+  const voted = codeReview === true ? " with Code-Review +1" : "";
+  return text(`posted review on change ${ticket.change},${ticket.patchset}${voted}`, 200);
+}
+
+// --- /muse-token ----------------------------------------------------------------
+// Minting needs the same OIDC token and ticket as voting; the ticket's repo,
+// change, patch set and revision become the token's scope, and the OIDC
+// run_id names the run whose completion revokes it.
+
+function museSecret(env: Env): string {
+  return env.MUSE_TOKEN_SECRET || env.TICKET_SECRET;
+}
+
+function museTtl(env: Env): number {
+  const seconds = Number(env.MUSE_TOKEN_TTL_SECONDS);
+  if (!Number.isFinite(seconds) || seconds <= 0) return MUSE_TOKEN_TTL_SECONDS;
+  return Math.min(Math.floor(seconds), 3600);
+}
+
+async function handleMuseToken(request: Request, env: Env, deps: Deps): Promise<Response> {
+  if (request.method !== "POST") return text("method not allowed", 405, { Allow: "POST" });
+
+  const auth = await authenticateRunner(request, env, deps);
+  if (auth instanceof Response) return auth;
+  const { claims, ticket, ticketText } = auth;
+
+  const ttl = museTtl(env);
+  const now = deps.now();
+  const token = await signMuseToken(
+    { repo: ticket.repo, change: ticket.change, patchset: ticket.patchset, revision: ticket.revision, ticket: ticketText, run_id: claims.run_id },
+    museSecret(env),
+    now,
+    ttl,
+  );
+  return Response.json({ token, expires_in: ttl, expires_at: new Date((now + ttl) * 1000).toISOString() });
+}
+
+// --- /v1/* proxy ----------------------------------------------------------------
+// Accepts only ephemeral tokens from /muse-token: a GitHub OIDC token fails
+// the HMAC check. The LLM key travels only between the Worker and the LLM.
+
+async function handleProxy(request: Request, env: Env, deps: Deps): Promise<Response> {
+  if (!env.LLM_API_KEY) return text("review proxy is not configured", 501);
+  const header = request.headers.get("Authorization") ?? "";
+  const token = /^Bearer\s+(\S+)$/i.exec(header)?.[1];
+  if (!token) return text("missing bearer token", 401, { "WWW-Authenticate": "Bearer" });
+  // Rejected before anything is forwarded: unknown, expired and revoked
+  // tokens all land here, as does any non-ephemeral token.
+  let runId: string;
+  try {
+    runId = (await verifyMuseToken(token, museSecret(env), deps.now())).run_id;
+  } catch (e) {
+    if (e instanceof MuseTokenError) return text("bad review token", 401, { "WWW-Authenticate": "Bearer" });
+    return text("could not check the review token", 502);
+  }
+  try {
+    if (await deps.museTokens.isRevoked(runId)) return text("bad review token", 401, { "WWW-Authenticate": "Bearer" });
+  } catch {
+    return text("could not check the review token", 502);
+  }
+  const url = new URL(request.url);
+  const suffix = url.pathname.slice("/v1".length) || "/";
+  try {
+    return await proxyToLlm(request, suffix, url.search, env.LLM_API_KEY, env.LLM_BASE_URL || DEFAULT_LLM_BASE_URL, deps.fetch);
+  } catch (e) {
+    return text(`review backend failed: ${(e as Error).message}`, 502);
+  }
+}
+
+// --- /github-webhook ------------------------------------------------------------
+// GitHub's workflow_job and workflow_run events. Only forward progress
+// matters: jobs move queued -> in_progress -> completed, and a completed run
+// has its tokens revoked and its job markers deleted. Anything else only
+// moves a marker. Retried deliveries are answered 200 so GitHub stops
+// retrying.
+//
+// Revocation happens on run completion, not job completion: the review job
+// runs after the verify job, so revoking when verify completes would lock the
+// review out of the proxy while the run is still going.
+
+interface WorkflowJobBody {
+  action?: string;
+  workflow_job?: { id?: number | string; run_id?: number | string };
+  workflow_run?: { id?: number | string };
+}
+
+async function handleGithubWebhook(request: Request, env: Env, deps: Deps): Promise<Response> {
+  if (request.method !== "POST") return text("method not allowed", 405, { Allow: "POST" });
+  if (!env.GITHUB_WEBHOOK_SECRET) return text("not found", 404);
+  const raw = await request.text().catch(() => "");
+  const signed = await verifyWebhookSignature(raw, request.headers.get("X-Hub-Signature-256"), env.GITHUB_WEBHOOK_SECRET);
+  if (!signed) return text("bad webhook signature", 401);
+  let body: WorkflowJobBody;
+  try {
+    body = JSON.parse(raw) as WorkflowJobBody;
+  } catch {
+    return text("body is not JSON", 400);
+  }
+  // GitHub's ping when the webhook is created: acknowledge it and stop.
+  if (!body.workflow_job && !body.workflow_run) return text("pong", 200);
+  const action = body.action ?? "";
+  try {
+    if (body.workflow_run) {
+      const runId = body.workflow_run.id;
+      if (runId === undefined) return text("ignored: no run", 200);
+      if (action !== "completed") return text(`run ${runId} ${action}: ignored`, 200);
+      const progress = await deps.museTokens.completeRun(String(runId), museTtl(env));
+      if (progress === "advanced") deps.log(`run ${runId} completed; revoked its review tokens`);
+      return text(`run ${runId} completed: ${progress}`, 200);
+    }
+    const jobId = body.workflow_job!.id;
+    if (jobId === undefined) return text("ignored: no job", 200);
+    const runId = body.workflow_job!.run_id;
+    if (runId === undefined) return text("ignored: no run", 200);
+    const progress: JobProgress = await deps.museTokens.noteJob(String(runId), String(jobId), action, museTtl(env));
+    return text(`job ${jobId} ${action}: ${progress}`, 200);
+  } catch (e) {
+    return text(`token store failed: ${(e as Error).message}`, 502);
+  }
 }
 
 // --- routing ------------------------------------------------------------------
@@ -329,6 +561,10 @@ function secretMatches(given: string, secret: string): boolean {
 export async function handle(request: Request, env: Env, deps: Deps): Promise<Response> {
   const path = new URL(request.url).pathname;
   if (path === "/vote") return handleVote(request, env, deps);
+  if (path === "/review") return handleReview(request, env, deps);
+  if (path === "/muse-token") return handleMuseToken(request, env, deps);
+  if (path === "/github-webhook") return handleGithubWebhook(request, env, deps);
+  if (path === "/v1" || path.startsWith("/v1/")) return handleProxy(request, env, deps);
   const gerrit = /^\/gerrit\/([^/]+)$/.exec(path);
   if (gerrit && secretMatches(decodeURIComponent(gerrit[1]), env.WEBHOOK_SECRET || "")) {
     return handleGerrit(request, env, deps);

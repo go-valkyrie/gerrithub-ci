@@ -21,6 +21,8 @@ interface RevisionInfo {
   _number?: number;
   ref?: string;
   uploader?: AccountInfo;
+  /** How the patch set differs from the previous one, e.g. REWORK or TRIVIAL_REBASE. */
+  kind?: string;
 }
 
 interface ChangeMessageInfo {
@@ -101,4 +103,19 @@ export function confirmChange(change: ChangeInfo, target: Target, trusted: strin
     }
   }
   return { confirmed: true, uploader: display(revision.uploader) };
+}
+
+/** Change kinds with no new code to verify: CI would only repeat the last vote. */
+const SKIP_KINDS = new Set(["TRIVIAL_REBASE", "NO_CHANGE"]);
+
+/**
+ * The `target` patch set's change kind, if Gerrit says it carries no new
+ * code worth verifying. Only fresh patch sets are ever skipped: a recheck
+ * always runs, because a trusted reviewer explicitly asked for it. Unknown
+ * or absent kinds run too, so an older Gerrit changes nothing.
+ */
+export function trivialKind(change: ChangeInfo, target: Target): string | undefined {
+  if (target.trigger !== "patchset-created") return undefined;
+  const kind = change.revisions?.[target.revision]?.kind;
+  return kind && SKIP_KINDS.has(kind) ? kind : undefined;
 }

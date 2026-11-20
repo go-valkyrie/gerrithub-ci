@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Target } from "../src/gerrit";
-import { confirmChange, fetchChange, GerritError } from "../src/verify";
+import { confirmChange, fetchChange, GerritError, trivialKind } from "../src/verify";
 
 const REV = "0123456789abcdef0123456789abcdef01234567";
 const OTHER = "89abcdef0123456789abcdef0123456789abcdef";
@@ -18,14 +18,14 @@ const target: Target = {
 };
 
 /** A change as Gerrit's REST API returns it with ALL_REVISIONS, DETAILED_ACCOUNTS and MESSAGES. */
-export function changeInfo(over: { uploader?: string; messages?: { author: string; message: string; ps: number }[] } = {}) {
+export function changeInfo(over: { uploader?: string; kind?: string; messages?: { author: string; message: string; ps: number }[] } = {}) {
   return {
     project: "go-valkyrie/vali-scheme",
     branch: "main",
     _number: 7,
     revisions: {
       [OTHER]: { _number: 1, ref: "refs/changes/07/7/1", uploader: { _account_id: 1, username: "outsider" } },
-      [REV]: { _number: 2, ref: "refs/changes/07/7/2", uploader: { _account_id: 2, username: over.uploader ?? "maintainer" } },
+      [REV]: { _number: 2, ref: "refs/changes/07/7/2", uploader: { _account_id: 2, username: over.uploader ?? "maintainer" }, ...(over.kind ? { kind: over.kind } : {}) },
     },
     messages: (over.messages ?? []).map((m) => ({ author: { username: m.author }, message: m.message, _revision_number: m.ps })),
   };
@@ -73,6 +73,24 @@ describe("confirmChange", () => {
       const earlier = changeInfo({ uploader: "outsider", messages: [{ author: "maintainer", message: "Patch Set 1:\n\nrecheck", ps: 1 }] });
       expect(confirmChange(earlier, recheck, trusted).confirmed).toBe(false);
     });
+  });
+});
+
+describe("trivialKind", () => {
+  it("names TRIVIAL_REBASE and NO_CHANGE patch sets, but nothing else", () => {
+    expect(trivialKind(changeInfo({ kind: "TRIVIAL_REBASE" }), target)).toBe("TRIVIAL_REBASE");
+    expect(trivialKind(changeInfo({ kind: "NO_CHANGE" }), target)).toBe("NO_CHANGE");
+    expect(trivialKind(changeInfo({ kind: "REWORK" }), target)).toBeUndefined();
+    expect(trivialKind(changeInfo({ kind: "MERGE_FIRST_PARENT_UPDATE" }), target)).toBeUndefined();
+    expect(trivialKind(changeInfo({ kind: "NO_CODE_CHANGE" }), target)).toBeUndefined();
+    expect(trivialKind(changeInfo(), target)).toBeUndefined();
+    expect(trivialKind({}, target)).toBeUndefined();
+  });
+
+  it("never skips a recheck: a trusted reviewer explicitly asked for it", () => {
+    const recheck: Target = { ...target, trigger: "recheck" };
+    expect(trivialKind(changeInfo({ kind: "TRIVIAL_REBASE" }), recheck)).toBeUndefined();
+    expect(trivialKind(changeInfo({ kind: "NO_CHANGE" }), recheck)).toBeUndefined();
   });
 });
 
