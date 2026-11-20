@@ -98,7 +98,7 @@ async function oidc(claims: object = goodClaims, signer: CryptoKey = keys.privat
 const ticketFields: Ticket = { project: REPO, change: 42, patchset: 3, revision: REVISION, repo: REPO, iat: NOW - 600 };
 
 /** fetch that serves GitHub's JWKS, Gerrit's setReview, and the LLM backend; records calls. */
-function mockFetch(llmBody = "data: hello\n\ndata: world\n\n") {
+function mockFetch(llmBody = "data: hello\n\ndata: world\n\n", gerritStatus: (url: string) => number = () => 200) {
   const gerritCalls: { url: string; init: RequestInit }[] = [];
   const llmCalls: { url: string; init: RequestInit }[] = [];
   const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
@@ -108,7 +108,7 @@ function mockFetch(llmBody = "data: hello\n\ndata: world\n\n") {
     }
     if (u.startsWith("https://review.gerrithub.io/a/changes/")) {
       gerritCalls.push({ url: u, init: init ?? {} });
-      return Response.json({ ok: true });
+      return Response.json({ ok: true }, { status: gerritStatus(u) });
     }
     if (u.startsWith("https://api.meta.ai/v1/") || u.startsWith("https://llm.example/v1/")) {
       llmCalls.push({ url: u, init: init ?? {} });
@@ -557,8 +557,8 @@ describe("POST /github-webhook", () => {
 });
 
 describe("POST /review", () => {
-  async function review(opts: { token: string; ticket?: string; review?: unknown; codeReview?: unknown; comments?: unknown; env?: Env }) {
-    const { fetchImpl, gerritCalls } = mockFetch();
+  async function review(opts: { token: string; ticket?: string; review?: unknown; codeReview?: unknown; comments?: unknown; env?: Env; gerritStatus?: (url: string) => number }) {
+    const { fetchImpl, gerritCalls } = mockFetch(undefined, opts.gerritStatus);
     const d = deps(fetchImpl);
     const req = new Request("https://relay.example/review", {
       method: "POST",
@@ -643,9 +643,117 @@ describe("POST /review", () => {
       expect(res.status).toBe(400);
       expect(await res.text()).toMatch(pattern);
     }
-    expect((await review({ token: await oidc(), comments: [] })).res.status).toBe(400);
     expect((await review({ token: await oidc(), comments: "all of them" })).res.status).toBe(400);
     expect((await review({ token: await oidc(), comments: new Array(101).fill(good) })).res.status).toBe(400);
+  });
+
+  it("accepts an empty comments array as no comments", async () => {
+    const { res, gerritCalls } = await review({ token: await oidc(), comments: [] });
+    expect(res.status).toBe(200);
+    expect(gerritCalls).toHaveLength(1);
+    expect(JSON.parse(gerritCalls[0].init.body as string).comments).toBeUndefined();
+  });
+
+  const parent = "a1b2c3d4_0f1e2d3c";
+  const reviewUrl = (revision: string | number) =>
+    `https://review.gerrithub.io/a/changes/go-valkyrie%2Fvali-scheme~42/revisions/${revision}/review`;
+
+  it("rejects bad reply fields", async () => {
+    const base = { path: "src/a.ts", line: 1, message: "x" };
+    const cases: [Record<string, unknown>, RegExp][] = [
+      [{ in_reply_to: "nope" }, /bad in_reply_to/],
+      [{ in_reply_to: 7 }, /bad in_reply_to/],
+      [{ in_reply_to: `${parent}/../x` }, /bad in_reply_to/],
+      [{ in_reply_to: parent, unresolved: "false" }, /bad unresolved/],
+      [{ in_reply_to: parent, patch_set: 0 }, /bad patch_set/],
+      [{ in_reply_to: parent, patch_set: 4 }, /bad patch_set/],
+      [{ in_reply_to: parent, patch_set: 1.5 }, /bad patch_set/],
+      [{ in_reply_to: parent, patch_set: "2" }, /bad patch_set/],
+      [{ patch_set: 2 }, /earlier patch set but is not a reply/],
+    ];
+    for (const [extra, pattern] of cases) {
+      const { res, gerritCalls } = await review({ token: await oidc(), comments: [{ ...base, ...extra }] });
+      expect(res.status).toBe(400);
+      expect(await res.text()).toMatch(pattern);
+      expect(gerritCalls).toHaveLength(0);
+    }
+  });
+
+  it("passes in_reply_to and unresolved through on the current patch set", async () => {
+    const { res, gerritCalls } = await review({
+      token: await oidc(),
+      comments: [
+        { path: "src/a.ts", line: 3, message: "fixed", in_reply_to: parent, unresolved: false },
+        { path: "src/a.ts", line: 4, message: "new", unresolved: true, patch_set: 3 },
+      ],
+    });
+    expect(res.status).toBe(200);
+    expect(gerritCalls).toHaveLength(1);
+    expect(JSON.parse(gerritCalls[0].init.body as string).comments).toEqual({
+      "src/a.ts": [
+        { line: 3, message: "fixed", in_reply_to: parent, unresolved: false },
+        { line: 4, message: "new", unresolved: true },
+      ],
+    });
+  });
+
+  it("posts replies to earlier patch sets one comments-only review each, after the main review", async () => {
+    const other = "b1b2b3b4_c1c2c3c4";
+    const { res, gerritCalls } = await review({
+      token: await oidc(),
+      codeReview: 1,
+      comments: [
+        { path: "src/a.ts", line: 1, message: "now", in_reply_to: parent, unresolved: false, patch_set: 2 },
+        { path: "src/b.ts", line: 2, message: "current" },
+        { path: "src/c.ts", line: 3, message: "older", in_reply_to: other, patch_set: 1 },
+        { path: "src/d.ts", line: 4, message: "also ps2", in_reply_to: other, patch_set: 2 },
+      ],
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toMatch(/4 inline comments/);
+    expect(gerritCalls.map((c) => c.url)).toEqual([reviewUrl(REVISION), reviewUrl(1), reviewUrl(2)]);
+    const main = JSON.parse(gerritCalls[0].init.body as string);
+    expect(main.labels).toEqual({ "Code-Review": 1 });
+    expect(main.comments).toEqual({ "src/b.ts": [{ line: 2, message: "current" }] });
+    const ps1 = JSON.parse(gerritCalls[1].init.body as string);
+    expect(ps1).toEqual({ comments: { "src/c.ts": [{ line: 3, message: "older", in_reply_to: other }] }, tag: "autogenerated:gerrithub-ci" });
+    const ps2 = JSON.parse(gerritCalls[2].init.body as string);
+    expect(ps2.labels).toBeUndefined();
+    expect(ps2.message).toBeUndefined();
+    expect(ps2.comments).toEqual({
+      "src/a.ts": [{ line: 1, message: "now", in_reply_to: parent, unresolved: false }],
+      "src/d.ts": [{ line: 4, message: "also ps2", in_reply_to: other }],
+    });
+  });
+
+  it("counts comments across patch sets toward the limit", async () => {
+    const reply = { path: "src/a.ts", line: 1, message: "x", in_reply_to: parent, patch_set: 1 };
+    const { res } = await review({ token: await oidc(), comments: new Array(101).fill(reply) });
+    expect(res.status).toBe(400);
+  });
+
+  it("reports earlier patch sets that failed without undoing the main review", async () => {
+    const { res, gerritCalls } = await review({
+      token: await oidc(),
+      comments: [
+        { path: "src/a.ts", line: 1, message: "one", in_reply_to: parent, patch_set: 1 },
+        { path: "src/a.ts", line: 1, message: "two", in_reply_to: parent, patch_set: 2 },
+      ],
+      gerritStatus: (url) => (url === reviewUrl(1) ? 400 : 200),
+    });
+    expect(res.status).toBe(502);
+    expect(await res.text()).toMatch(/patch set 1\s*$/);
+    expect(gerritCalls.map((c) => c.url)).toEqual([reviewUrl(REVISION), reviewUrl(1), reviewUrl(2)]);
+  });
+
+  it("does not post earlier patch sets when the main review fails", async () => {
+    const { res, gerritCalls } = await review({
+      token: await oidc(),
+      comments: [{ path: "src/a.ts", line: 1, message: "one", in_reply_to: parent, patch_set: 1 }],
+      gerritStatus: () => 500,
+    });
+    expect(res.status).toBe(502);
+    expect(gerritCalls).toHaveLength(1);
   });
 
   it("never logs the review markdown", async () => {
