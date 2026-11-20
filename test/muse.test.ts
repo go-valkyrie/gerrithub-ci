@@ -231,6 +231,30 @@ describe("POST /muse-token", () => {
     expect((await mint(await oidc(forkClaims), ticket)).status).toBe(403);
   });
 
+  it("refuses to mint for a trivial rebase or unchanged patch set, but mints for the rest", async () => {
+    const trivial = await signTicket({ ...ticketFields, kind: "TRIVIAL_REBASE" }, env.TICKET_SECRET);
+    const unchanged = await signTicket({ ...ticketFields, kind: "NO_CHANGE" }, env.TICKET_SECRET);
+    expect((await mint(await oidc(), trivial)).status).toBe(409);
+    expect((await mint(await oidc(), unchanged)).status).toBe(409);
+    const rework = await signTicket({ ...ticketFields, kind: "REWORK" }, env.TICKET_SECRET);
+    expect((await mint(await oidc(), rework)).status).toBe(200);
+    // Old tickets predate the kind field entirely, and stay reviewable.
+    expect((await mint(await oidc(), await mintTicket())).status).toBe(200);
+  });
+
+  it("still posts reviews for trivial patch sets: only minting is gated", async () => {
+    const trivial = await signTicket({ ...ticketFields, kind: "TRIVIAL_REBASE" }, env.TICKET_SECRET);
+    const { fetchImpl, gerritCalls } = mockFetch();
+    const req = new Request("https://relay.example/review", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${await oidc()}` },
+      body: JSON.stringify({ ticket: trivial, review: "Rebase looks clean." }),
+    });
+    const res = await handle(req, env, deps(fetchImpl));
+    expect(res.status).toBe(200);
+    expect(gerritCalls).toHaveLength(1);
+  });
+
   it("only accepts POST", async () => {
     expect((await handle(new Request("https://relay.example/muse-token"), env, deps(vi.fn()))).status).toBe(405);
   });

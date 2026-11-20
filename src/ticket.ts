@@ -12,6 +12,8 @@ export interface Ticket {
   revision: string;
   /** GitHub "owner/repo" the dispatch went to. */
   repo: string;
+  /** How the patch set differs from the previous one, e.g. REWORK or TRIVIAL_REBASE. Absent when Gerrit didn't say. */
+  kind?: string;
   /** Issued at, in seconds since the epoch. */
   iat: number;
 }
