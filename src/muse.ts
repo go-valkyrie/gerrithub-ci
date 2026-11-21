@@ -198,7 +198,7 @@ export async function eventKey(event: GerritEvent, target: Target): Promise<stri
 /** The parts of DurableObjectStorage that EventClaim uses. */
 export interface ClaimStorage {
   get(key: string): Promise<unknown>;
-  put(key: string, value: unknown, opts?: { expirationTtl?: number }): Promise<void>;
+  put(key: string, value: unknown): Promise<void>;
   setAlarm(time: number): Promise<void>;
   deleteAll(): Promise<void>;
 }
@@ -206,8 +206,9 @@ export interface ClaimStorage {
 /**
  * One claimed delivery. The object is named after the event's key, so every
  * delivery of the event reaches the same instance, which handles them one at
- * a time. The alarm deletes everything after the window; the marker itself
- * is TTL'd too, so a misfired alarm can't leave it behind forever.
+ * a time. The alarm deletes everything after the window. Durable Object
+ * storage has no per-key expiry (`expirationTtl` is a Workers KV option), so
+ * the alarm is the only cleanup the marker gets.
  *
  * This is a plain class with a `fetch` method rather than an RPC
  * `DurableObject` subclass, so tests can build it without the Workers runtime.
@@ -231,7 +232,7 @@ export class EventClaim {
     // The alarm first: if the write fails after it, the alarm cleans up;
     // the other order could leave a key that is never deleted.
     await storage.setAlarm(this.now() + this.windowMs);
-    await storage.put("claimed", true, { expirationTtl: Math.ceil(this.windowMs / 1000) });
+    await storage.put("claimed", true);
     return true;
   }
 
@@ -263,17 +264,25 @@ export function claimerFor(namespace: DurableObjectNamespace): Claimer {
 // isolate is invisible to the rest. So each run's jobs and revocation live in
 // a Durable Object named after the run: every delivery of its jobs' events
 // reaches the same instance. Completing the run revokes its tokens and
-// deletes its job markers; every entry expires with the token lifetime, and
-// the token's own expiry is the backstop when the completion event never
-// arrives.
+// deletes its job markers. Durable Object storage has no per-key expiry, so
+// the object sets an alarm on its first write, for the token lifetime plus a
+// margin, and the alarm deletes everything. That also cleans up a run whose
+// completion event never arrives; the token's own expiry makes its job
+// markers moot by then.
 
 /** The parts of DurableObjectStorage that per-run token state uses. */
 export interface TokenStorage {
   get(key: string): Promise<unknown>;
-  put(key: string, value: unknown, opts?: { expirationTtl?: number }): Promise<void>;
+  put(key: string, value: unknown): Promise<void>;
   delete(key: string): Promise<boolean>;
   list(opts: { prefix: string }): Promise<Map<string, unknown>>;
+  getAlarm(): Promise<number | null>;
+  setAlarm(time: number): Promise<void>;
+  deleteAll(): Promise<void>;
 }
+
+/** How long past the token lifetime the alarm waits, so `revoked` outlives every token. */
+export const ALARM_MARGIN_SECONDS = 60;
 
 /** Progress of one workflow_job delivery, or of a run's completion. */
 export type JobProgress = "advanced" | "stale" | "unknown";
@@ -290,7 +299,28 @@ const JOB_ORDER: Record<string, number> = { queued: 0, in_progress: 1, completed
  * subclass, so tests can build it without the Workers runtime.
  */
 export class MuseTokens {
-  constructor(private readonly state: { storage: TokenStorage }) {}
+  constructor(
+    private readonly state: { storage: TokenStorage },
+    _env: unknown = undefined, // the runtime passes the Worker's env here
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  /**
+   * Makes sure the cleanup alarm fires after a token issued now would have
+   * expired. It is set on the first write and only ever pushed later, never
+   * earlier, so a short-lived write can't cut short a longer one. Called
+   * before the write: if the write fails, the alarm still cleans up.
+   */
+  private async ensureAlarm(ttlSeconds: number): Promise<void> {
+    const at = this.now() + (ttlSeconds + ALARM_MARGIN_SECONDS) * 1000;
+    const current = await this.state.storage.getAlarm();
+    if (current === null || current < at) await this.state.storage.setAlarm(at);
+  }
+
+  /** Deletes the run's state once its tokens can no longer be live. */
+  async alarm(): Promise<void> {
+    await this.state.storage.deleteAll();
+  }
 
   /** Records a delivery of one of the run's jobs. */
   async noteJob(jobId: string, action: string, ttlSeconds: number): Promise<JobProgress> {
@@ -299,7 +329,8 @@ export class MuseTokens {
     const key = `job:${jobId}`;
     const prev = await this.state.storage.get(key);
     if (typeof prev === "number" && rank <= prev) return "stale";
-    await this.state.storage.put(key, rank, { expirationTtl: ttlSeconds });
+    await this.ensureAlarm(ttlSeconds);
+    await this.state.storage.put(key, rank);
     return "advanced";
   }
 
@@ -311,8 +342,9 @@ export class MuseTokens {
    */
   async completeRun(ttlSeconds: number): Promise<"advanced" | "stale"> {
     if ((await this.state.storage.get("done")) !== undefined) return "stale";
-    await this.state.storage.put("revoked", true, { expirationTtl: ttlSeconds });
-    await this.state.storage.put("done", true, { expirationTtl: ttlSeconds });
+    await this.ensureAlarm(ttlSeconds);
+    await this.state.storage.put("revoked", true);
+    await this.state.storage.put("done", true);
     for (const key of (await this.state.storage.list({ prefix: "job:" })).keys()) {
       await this.state.storage.delete(key);
     }

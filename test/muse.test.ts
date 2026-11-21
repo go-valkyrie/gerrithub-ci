@@ -2,7 +2,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { toBase64Url, utf8 } from "../src/encoding";
 import { handle, type Env } from "../src/index";
 import { GITHUB_ISSUER, resetKeyCache } from "../src/oidc";
-import { MuseTokens, sha256Hex, signMuseToken, tokensFor, verifyMuseToken, type MuseTokensClient, type TokenStorage } from "../src/muse";
+import { ALARM_MARGIN_SECONDS, MuseTokens, sha256Hex, signMuseToken, tokensFor, verifyMuseToken, type MuseTokensClient, type TokenStorage } from "../src/muse";
 import { signTicket, type Ticket } from "../src/ticket";
 
 const NOW = 1_800_000_000;
@@ -47,14 +47,18 @@ function memoryNamespace() {
     let o = objects.get(name);
     if (!o) {
       const data = new Map<string, unknown>();
+      let alarm: number | null = null;
       const storage: TokenStorage = {
         get: async (key: string) => data.get(key),
-        put: async (key: string, value: unknown, opts?: { expirationTtl?: number }) => {
-          data.set(key, value);
-          void opts;
-        },
+        put: async (key: string, value: unknown) => void data.set(key, value),
         delete: async (key: string) => data.delete(key),
         list: async ({ prefix }: { prefix: string }) => new Map([...data].filter(([k]) => k.startsWith(prefix))),
+        getAlarm: async () => alarm,
+        setAlarm: async (t: number) => void (alarm = t),
+        deleteAll: async () => {
+          data.clear();
+          alarm = null;
+        },
       };
       o = new MuseTokens({ storage });
       objects.set(name, o);
@@ -284,19 +288,22 @@ describe("ephemeral tokens", () => {
 });
 
 describe("MuseTokens", () => {
-  function recording() {
+  function recording(now = () => 1_000_000) {
     const data = new Map<string, unknown>();
-    const puts: { key: string; value: unknown; opts?: { expirationTtl?: number } }[] = [];
+    let alarm: number | null = null;
     const storage: TokenStorage = {
       get: async (key: string) => data.get(key),
-      put: async (key: string, value: unknown, opts?: { expirationTtl?: number }) => {
-        data.set(key, value);
-        puts.push({ key, value, opts });
-      },
+      put: async (key: string, value: unknown) => void data.set(key, value),
       delete: async (key: string) => data.delete(key),
       list: async ({ prefix }: { prefix: string }) => new Map([...data].filter(([k]) => k.startsWith(prefix))),
+      getAlarm: async () => alarm,
+      setAlarm: async (t: number) => void (alarm = t),
+      deleteAll: async () => {
+        data.clear();
+        alarm = null;
+      },
     };
-    return { data, state: new MuseTokens({ storage }), puts };
+    return { data, state: new MuseTokens({ storage }, {}, now), alarmAt: () => alarm };
   }
 
   it("is forward-only per job, without revoking", async () => {
@@ -321,13 +328,56 @@ describe("MuseTokens", () => {
     expect(await state.noteJob("9", "requested", 1800)).toBe("unknown");
   });
 
-  it("expires every entry with the given TTL", async () => {
-    const { state, puts } = recording();
+  it("sets an alarm on its first write: the TTL plus the margin", async () => {
+    const { state, alarmAt } = recording();
+    expect(alarmAt()).toBeNull();
     await state.noteJob("7", "in_progress", 60);
+    expect(alarmAt()).toBe(1_000_000 + (60 + ALARM_MARGIN_SECONDS) * 1000);
+  });
+
+  it("sets the alarm when the first write is the completion", async () => {
+    const { state, alarmAt } = recording();
     await state.completeRun(60);
-    expect(puts).toContainEqual({ key: "job:7", value: 1, opts: { expirationTtl: 60 } });
-    expect(puts).toContainEqual({ key: "revoked", value: true, opts: { expirationTtl: 60 } });
-    expect(puts).toContainEqual({ key: "done", value: true, opts: { expirationTtl: 60 } });
+    expect(alarmAt()).toBe(1_000_000 + (60 + ALARM_MARGIN_SECONDS) * 1000);
+  });
+
+  it("never pulls the alarm earlier, and pushes it later for a longer TTL", async () => {
+    const { state, alarmAt } = recording();
+    await state.noteJob("7", "queued", 1800);
+    const first = alarmAt();
+    await state.noteJob("7", "in_progress", 60);
+    expect(alarmAt()).toBe(first);
+    await state.completeRun(60);
+    expect(alarmAt()).toBe(first);
+    await state.noteJob("8", "queued", 3600);
+    expect(alarmAt()).toBe(1_000_000 + (3600 + ALARM_MARGIN_SECONDS) * 1000);
+  });
+
+  it("keeps the alarm when the run completes", async () => {
+    const { state, alarmAt } = recording();
+    await state.noteJob("7", "queued", 1800);
+    await state.completeRun(1800);
+    expect(alarmAt()).not.toBeNull();
+  });
+
+  it("alarm() empties storage", async () => {
+    const { data, state, alarmAt } = recording();
+    await state.noteJob("7", "queued", 1800);
+    await state.completeRun(1800);
+    await state.noteJob("8", "queued", 1800);
+    expect(data.size).toBeGreaterThan(0);
+    await state.alarm();
+    expect(data.size).toBe(0);
+    expect(alarmAt()).toBeNull();
+  });
+
+  it("stays revoked until the alarm fires", async () => {
+    const { state } = recording();
+    await state.completeRun(1800);
+    expect(await state.isRevoked()).toBe(true);
+    expect(await state.isRevoked()).toBe(true);
+    await state.alarm();
+    expect(await state.isRevoked()).toBe(false);
   });
 
   it("completing the run revokes its tokens and deletes its job markers, once", async () => {
